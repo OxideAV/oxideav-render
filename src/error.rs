@@ -19,6 +19,12 @@ pub enum Error {
     /// [`oxideav_mesh3d::Error`].
     #[error("3D scene error: {0}")]
     Scene(#[from] oxideav_mesh3d::Error),
+
+    /// [`crate::RenderRegistry::make`] was called with a name that
+    /// nothing had registered. The wrapped string is the name that
+    /// missed.
+    #[error("renderer backend '{0}' not registered")]
+    BackendNotFound(String),
 }
 
 /// Crate-local `Result` alias.

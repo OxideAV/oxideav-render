@@ -60,6 +60,7 @@
 pub mod error;
 pub mod image;
 pub mod options;
+pub mod registry;
 mod scanline;
 
 pub use error::{Error, Result};
@@ -67,6 +68,7 @@ pub use image::RgbaImage;
 pub use options::{
     BackgroundColor, CameraSpec, LightSpec, Projection, RenderBackend, RenderOptions, ShadingMode,
 };
+pub use registry::{register_into, RenderRegistry, RendererFactory};
 
 /// Renderer trait — the surface every backend (Scanline / Raycast /
 /// PathTrace) implements.

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`RenderRegistry` + `register_into`** — Phase C-1 of the pipeline
+  integration. Process-wide named lookup for renderer backends (parallel
+  to `oxideav_mesh3d::Mesh3DRegistry`); `oxideav-meta` and the future
+  `oxideav-pipeline` executor consult the registry to instantiate a
+  backend from a string name in the JSON job graph. Built-in registration
+  covers `"scanline"`.
+- **`Error::BackendNotFound(String)`** — returned by
+  `RenderRegistry::make` when no factory is registered under the
+  requested name. Additive — the enum is already `#[non_exhaustive]`.
 - **Phase B — scanline backend lands.** `make_renderer(Scanline)` now
   returns a working renderer instead of `Err(NotImplemented)`. The
   rasteriser migrates verbatim from `oxideav-cli-convert/src/mesh3d_render.rs`
