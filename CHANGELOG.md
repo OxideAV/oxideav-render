@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-render/releases/tag/v0.0.1) - 2026-06-07
+
+### Added
+
+- oxideav-render Phase A scaffold (Renderer trait + RenderBackend stub)
+
 ### Added
 
 - **Phase A scaffold** — 3D-scene → raster renderer Phase 1.
