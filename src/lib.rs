@@ -63,12 +63,18 @@ pub mod options;
 pub mod registry;
 mod scanline;
 
+#[cfg(feature = "registry")]
+pub mod source;
+
 pub use error::{Error, Result};
 pub use image::RgbaImage;
 pub use options::{
     BackgroundColor, CameraSpec, LightSpec, Projection, RenderBackend, RenderOptions, ShadingMode,
 };
 pub use registry::{register_into, RenderRegistry, RendererFactory};
+
+#[cfg(feature = "registry")]
+pub use source::RenderSource;
 
 /// Renderer trait — the surface every backend (Scanline / Raycast /
 /// PathTrace) implements.

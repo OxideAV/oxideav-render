@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RenderSource`** — `oxideav_core::FrameSource` impl wrapping a
+  `Scene3D` + `Box<dyn Renderer>` + `RenderOptions`. Phase C-3d of
+  the pipeline integration. Emits one `Frame::Video` for the
+  still-scene case then `Error::Eof`. Animation-aware variant
+  deferred to a future phase. Used by the cli-convert-installed
+  `render_source_factory` callback on oxideav-pipeline's RunContext
+  to bridge the renderer into the pipeline DAG. Gated on the
+  `registry` cargo feature alongside the `oxideav-core` dep — the
+  standalone build does not expose this type because `FrameSource`
+  itself lives in `oxideav-core`.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-render/compare/v0.0.1...v0.0.2) - 2026-06-07
 
 ### Added
@@ -17,44 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - release v0.0.1 ([#1](https://github.com/OxideAV/oxideav-render/pull/1))
-
-### Added
-
-- **`RenderRegistry` + `register_into`** — Phase C-1 of the pipeline
-  integration. Process-wide named lookup for renderer backends (parallel
-  to `oxideav_mesh3d::Mesh3DRegistry`); `oxideav-meta` and the future
-  `oxideav-pipeline` executor consult the registry to instantiate a
-  backend from a string name in the JSON job graph. Built-in registration
-  covers `"scanline"`.
-- **`Error::BackendNotFound(String)`** — returned by
-  `RenderRegistry::make` when no factory is registered under the
-  requested name. Additive — the enum is already `#[non_exhaustive]`.
-- **Phase B — scanline backend lands.** `make_renderer(Scanline)` now
-  returns a working renderer instead of `Err(NotImplemented)`. The
-  rasteriser migrates verbatim from `oxideav-cli-convert/src/mesh3d_render.rs`
-  (rounds 44 + 45 in that crate) and lives under a new `scanline`
-  module. Half-space edge-function pipeline with per-pixel z-buffer;
-  supports Flat / Gouraud / Phong / Wireframe shading + NormalDebug /
-  DepthDebug visualisers, SSAA (1..=8) via box-filter downsample,
-  perspective + orthographic projection with auto-frame or orbit
-  camera, and a single directional light with constant ambient term.
-- **`ScanlineRenderer` public type** — direct constructor parallel to
-  the [`make_renderer`] dispatch path, matching the dual-API
-  convention used across the workspace.
-- **Extended `RenderOptions`**: `light: LightSpec`,
-  `camera: Option<CameraSpec>` — promoted from `Mesh3DOptions` in
-  cli-convert so the framework-wide options struct carries every knob
-  the rasteriser honours. `LightSpec::default_light()` matches the
-  rasteriser baseline (azimuth 45°, elevation 45°, intensity 1.0).
-- Algorithmic provenance documented in `scanline.rs` module header:
-  Pineda 1988 (half-space rasterisation), Bresenham 1965 (line walker),
-  IEC 61966-2-1 (sRGB encoding), OpenGL right-handed conventions for
-  look-at / perspective / orthographic matrices.
-
-### Changed
-
-- Module documentation for the lib root reflects Phase B status; the
-  `make_renderer` doc-comment promises `Scanline` now succeeds.
 
 ## [0.0.1](https://github.com/OxideAV/oxideav-render/releases/tag/v0.0.1) - 2026-06-07
 
