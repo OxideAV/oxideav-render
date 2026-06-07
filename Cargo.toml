@@ -1,0 +1,37 @@
+[package]
+name = "oxideav-render"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust 3D-scene → raster image/video renderer scaffold for the oxideav framework — Phase 1 Renderer trait + RenderBackend stub. Scanline rasteriser migration and a future raycaster live behind a single trait surface."
+repository = "https://github.com/OxideAV/oxideav-render"
+homepage = "https://github.com/OxideAV/oxideav-render"
+readme = "README.md"
+keywords = ["multimedia", "render", "3d", "rasteriser", "pure-rust"]
+categories = ["multimedia::encoding", "rendering"]
+
+[features]
+default = ["registry"]
+
+# Wire the crate's render hook into `oxideav-core::RuntimeContext`.
+# Disable for a standalone build that exposes the `Renderer` trait +
+# `make_renderer` factory without dragging in the framework dependency
+# tree.
+registry = ["dep:oxideav-core"]
+
+[dependencies]
+# The renderer trait takes `&oxideav_mesh3d::Scene3D`. `mesh3d` is a
+# hard dependency — without it the trait has no meaningful input type.
+# `Scene3D` is a stable 0.0.x sibling-crate surface.
+oxideav-mesh3d = { version = "0.0" }
+
+# Optional under the `registry` feature so consumers can use the
+# Renderer trait + factory without pulling the framework dependency
+# tree.
+oxideav-core = { version = "0.1", optional = true }
+
+# `thiserror` is a widely-used `Error` derive macro — already a
+# workspace-level dep used by several sibling crates.
+thiserror = "1"
