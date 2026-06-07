@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-render/compare/v0.0.1...v0.0.2) - 2026-06-07
+
+### Added
+
+- RenderRegistry — Phase C-1 named backend lookup
+- Phase B — scanline backend lands behind make_renderer(Scanline)
+
+### Other
+
+- release v0.0.1 ([#1](https://github.com/OxideAV/oxideav-render/pull/1))
+
 ### Added
 
 - **`RenderRegistry` + `register_into`** — Phase C-1 of the pipeline
