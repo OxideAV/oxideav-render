@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-render/compare/v0.0.2...v0.0.3) - 2026-06-07
+
+### Added
+
+- RenderSource impl FrameSource — Phase C-3d pipeline source bridge
+
 ### Added
 
 - **`RenderSource`** — `oxideav_core::FrameSource` impl wrapping a
