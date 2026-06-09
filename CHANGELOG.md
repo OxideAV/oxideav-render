@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RgbaImage` typed accessors** — `set_pixel(x, y, rgba) -> bool`
+  mirror of the existing `pixel(x, y)` getter, `pixel_count() -> u64`,
+  `is_empty() -> bool`, `pixels_rgba()` iterator yielding `[u8; 4]`
+  per pixel in row-major order, and `rows()` iterator yielding
+  per-row `&[u8]` slices (stride-aware so a future padded layout
+  doesn't break the walker). Lets downstream consumers stitch into
+  or stream out of the renderer output without hand-rolling
+  `stride`-aware byte arithmetic.
+- **`RenderOptions::validate() -> Result<()>`** — typed pre-flight
+  check returning the new `Error::InvalidOptions(String)` variant on
+  zero `width`/`height`, out-of-range `fov_deg` / `aa`, non-finite
+  or negative `light.intensity`, non-finite light angles, or a bogus
+  `camera` override (non-finite angles / `distance <= 0`). Not
+  called automatically by `Renderer::render` (backends still
+  silently clamp) — opt-in for `oxideav-pipeline`'s `Render3D` DAG
+  node which wants strict failure on a malformed job graph.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-render/compare/v0.0.2...v0.0.3) - 2026-06-07
 
 ### Added

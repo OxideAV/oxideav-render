@@ -1,6 +1,8 @@
 //! [`RenderOptions`] + companion enums — the surface that every
 //! [`crate::Renderer`] consumes.
 
+use crate::error::{Error, Result};
+
 /// Backend selector used by [`crate::make_renderer`].
 ///
 /// Phase A shipped the selector with no working backend. Phase B
@@ -170,6 +172,94 @@ impl Default for RenderOptions {
     }
 }
 
+impl RenderOptions {
+    /// Validate the field values against the renderer contract and
+    /// return a descriptive [`Error::InvalidOptions`] for the first
+    /// offending field. `Ok(())` means every backend can consume the
+    /// options without an immediate sanity-clamp.
+    ///
+    /// Constraints enforced (matching the scanline backend's own
+    /// expectations, kept identical for the future raycast / path-trace
+    /// backends so a single `validate` covers all three):
+    ///
+    /// * `width` and `height` are `>= 1`.
+    /// * `fov_deg` is finite and strictly within `(0, 180)` — only
+    ///   meaningful in perspective mode but checked unconditionally so
+    ///   a stray NaN doesn't slip through a later mode flip.
+    /// * `aa` is within `1..=8` (the scanline backend's documented
+    ///   range; clamps silently above that today, but a typed validate
+    ///   reflects intent).
+    /// * `light.intensity` is finite and `>= 0.0`.
+    /// * `light.azimuth_deg` and `light.elevation_deg` are finite.
+    /// * If `camera` is `Some`, every field is finite and `distance`
+    ///   is `> 0`.
+    ///
+    /// `validate` is **not** called automatically by [`crate::Renderer::render`]
+    /// — backends today silently clamp instead — so a caller that wants
+    /// strict failure on bad input opts in by calling this method
+    /// before `render`. `oxideav-pipeline`'s `Render3D` DAG node is the
+    /// expected first consumer.
+    pub fn validate(&self) -> Result<()> {
+        if self.width == 0 {
+            return Err(Error::InvalidOptions(format!(
+                "width must be >= 1, got {}",
+                self.width
+            )));
+        }
+        if self.height == 0 {
+            return Err(Error::InvalidOptions(format!(
+                "height must be >= 1, got {}",
+                self.height
+            )));
+        }
+        if !self.fov_deg.is_finite() {
+            return Err(Error::InvalidOptions(format!(
+                "fov_deg must be finite, got {}",
+                self.fov_deg
+            )));
+        }
+        if !(0.0 < self.fov_deg && self.fov_deg < 180.0) {
+            return Err(Error::InvalidOptions(format!(
+                "fov_deg must be in (0, 180), got {}",
+                self.fov_deg
+            )));
+        }
+        if !(1..=8).contains(&self.aa) {
+            return Err(Error::InvalidOptions(format!(
+                "aa must be in 1..=8, got {}",
+                self.aa
+            )));
+        }
+        if !self.light.intensity.is_finite() || self.light.intensity < 0.0 {
+            return Err(Error::InvalidOptions(format!(
+                "light.intensity must be finite and >= 0.0, got {}",
+                self.light.intensity
+            )));
+        }
+        if !self.light.azimuth_deg.is_finite() || !self.light.elevation_deg.is_finite() {
+            return Err(Error::InvalidOptions(format!(
+                "light.azimuth_deg / light.elevation_deg must be finite, got ({}, {})",
+                self.light.azimuth_deg, self.light.elevation_deg
+            )));
+        }
+        if let Some(cam) = self.camera {
+            if !cam.azimuth_deg.is_finite() || !cam.elevation_deg.is_finite() {
+                return Err(Error::InvalidOptions(format!(
+                    "camera.azimuth_deg / camera.elevation_deg must be finite, got ({}, {})",
+                    cam.azimuth_deg, cam.elevation_deg
+                )));
+            }
+            if !cam.distance.is_finite() || cam.distance <= 0.0 {
+                return Err(Error::InvalidOptions(format!(
+                    "camera.distance must be finite and > 0, got {}",
+                    cam.distance
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +288,145 @@ mod tests {
         match RenderBackend::Scanline {
             RenderBackend::Scanline => {}
         }
+    }
+
+    #[test]
+    fn validate_accepts_default_options() {
+        assert!(RenderOptions::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_width_or_height() {
+        let opts = RenderOptions {
+            width: 0,
+            ..RenderOptions::default()
+        };
+        let msg = match opts.validate() {
+            Err(Error::InvalidOptions(s)) => s,
+            other => panic!("expected InvalidOptions, got {other:?}"),
+        };
+        assert!(msg.contains("width"), "msg should mention width: {msg}");
+
+        let opts = RenderOptions {
+            height: 0,
+            ..RenderOptions::default()
+        };
+        let msg = match opts.validate() {
+            Err(Error::InvalidOptions(s)) => s,
+            other => panic!("expected InvalidOptions, got {other:?}"),
+        };
+        assert!(msg.contains("height"), "msg should mention height: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_fov() {
+        for bad in [0.0_f32, -1.0, 180.0, 360.0, f32::NAN, f32::INFINITY] {
+            let opts = RenderOptions {
+                fov_deg: bad,
+                ..RenderOptions::default()
+            };
+            assert!(
+                matches!(opts.validate(), Err(Error::InvalidOptions(_))),
+                "fov_deg = {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_aa() {
+        for bad in [0_u32, 9, u32::MAX] {
+            let opts = RenderOptions {
+                aa: bad,
+                ..RenderOptions::default()
+            };
+            assert!(
+                matches!(opts.validate(), Err(Error::InvalidOptions(_))),
+                "aa = {bad} should be rejected"
+            );
+        }
+        // In-range still passes.
+        for ok in [1_u32, 4, 8] {
+            let opts = RenderOptions {
+                aa: ok,
+                ..RenderOptions::default()
+            };
+            assert!(opts.validate().is_ok(), "aa = {ok} should pass");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_or_non_finite_light() {
+        let opts = RenderOptions {
+            light: LightSpec {
+                intensity: -0.1,
+                ..LightSpec::default_light()
+            },
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+
+        let opts = RenderOptions {
+            light: LightSpec {
+                intensity: f32::NAN,
+                ..LightSpec::default_light()
+            },
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+
+        let opts = RenderOptions {
+            light: LightSpec {
+                azimuth_deg: f32::NAN,
+                ..LightSpec::default_light()
+            },
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+    }
+
+    #[test]
+    fn validate_rejects_bad_camera_distance() {
+        let opts = RenderOptions {
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: 0.0,
+            }),
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+
+        let opts = RenderOptions {
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: -1.0,
+            }),
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+
+        let opts = RenderOptions {
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: f32::INFINITY,
+            }),
+            ..RenderOptions::default()
+        };
+        assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
+    }
+
+    #[test]
+    fn validate_accepts_good_camera_override() {
+        let opts = RenderOptions {
+            camera: Some(CameraSpec {
+                elevation_deg: 30.0,
+                azimuth_deg: 45.0,
+                distance: 1.5,
+            }),
+            ..RenderOptions::default()
+        };
+        assert!(opts.validate().is_ok());
     }
 }

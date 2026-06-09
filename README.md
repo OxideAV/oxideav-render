@@ -47,6 +47,22 @@ consume that surface directly. `oxideav-cli-convert` handles the
 encoder dispatch — the render crate does not pull in image-encoder
 deps.
 
+Typed accessors on `RgbaImage` — `pixel(x, y)` / `set_pixel(x, y, rgba)`,
+`pixel_count()`, `is_empty()`, `pixels_rgba()` (row-major `[u8; 4]`
+iterator), `rows()` (per-row `&[u8]` slice iterator) — keep
+downstream consumers free of stride-aware byte arithmetic.
+
+## Option validation
+
+`RenderOptions::validate() -> Result<()>` runs a typed pre-flight
+check (width/height ≥ 1, `fov_deg ∈ (0, 180)`, `aa ∈ 1..=8`,
+finite + non-negative `light.intensity`, finite light/camera
+angles, positive finite `camera.distance`) and surfaces the first
+offending field via the `Error::InvalidOptions(String)` variant.
+`Renderer::render` does **not** call it automatically — backends
+still clamp silently — so a caller wanting strict failure on a
+malformed job graph opts in before calling `render`.
+
 ## Standalone build
 
 Drop the `registry` feature to build without `oxideav-core`:

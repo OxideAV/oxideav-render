@@ -25,6 +25,13 @@ pub enum Error {
     /// missed.
     #[error("renderer backend '{0}' not registered")]
     BackendNotFound(String),
+
+    /// [`crate::RenderOptions::validate`] caught a malformed option
+    /// before any backend touched it. The wrapped string describes the
+    /// offending field and value so the caller can surface it to a UI
+    /// or a job-graph validator without re-deriving the constraint.
+    #[error("invalid render options: {0}")]
+    InvalidOptions(String),
 }
 
 /// Crate-local `Result` alias.
