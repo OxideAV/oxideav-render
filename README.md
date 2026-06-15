@@ -1,23 +1,28 @@
 # oxideav-render
 
-Pure-Rust 3D-scene → raster image/video renderer for the
+Pure-Rust 3D-scene → raster image renderer for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
+Consumes an [`oxideav_mesh3d::Scene3D`] and produces a packed RGBA8
+[`RgbaImage`].
 
-**Status:** Phase A scaffold (2026-06-07) — `Renderer` trait +
-`RenderBackend` selector + `make_renderer` stub. Backends land in
-follow-up phases.
+## Status
 
-## Roadmap
+The **scanline backend** is implemented and working:
+`make_renderer(RenderBackend::Scanline)` returns a live renderer
+backed by a half-space edge-function rasteriser with a per-pixel
+z-buffer. Raytraced and path-traced backends are not yet implemented.
 
-| Phase | Surface added                                                                       |
-|-------|------------------------------------------------------------------------------------|
-| **A** *(now)* | `Renderer` trait + `RenderBackend::Scanline` variant + `make_renderer` stub. |
-| **B**         | Scanline backend (Gouraud / Phong / Wireframe / Flat / NormalDebug / Depth).  |
-| **C**         | `oxideav-pipeline` `DagNode::Render3D` source — emits `Frame::Video`.         |
-| **D**         | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
-| **E**         | `RenderBackend::PathTrace` — Kajiya path tracing + Disney/Burley BRDF.        |
+| Backend     | Status                                                       |
+| ----------- | ----------------------------------------------------------- |
+| `Scanline`  | done — Gouraud / Phong / Flat / Wireframe / NormalDebug / DepthDebug shading, perspective + orthographic projection, directional light |
+| `Raycast`   | not yet — Whitted primary + shadow + reflection / refraction |
+| `PathTrace` | not yet — path tracing + physically-based BRDF              |
 
-## Usage (Phase A surface)
+The scanline backend has no global illumination and no raytraced
+shadows. Pipeline integration (an `oxideav-pipeline` frame source) is
+a follow-up.
+
+## Usage
 
 ```rust,no_run
 use oxideav_render::{make_renderer, RenderBackend, RenderOptions, Result};
@@ -35,33 +40,29 @@ fn render_one(scene: &Scene3D) -> Result<()> {
 }
 ```
 
-Phase A `make_renderer` returns `Err(Error::NotImplemented)` for every
-backend. Phase B (migration of the existing scanline rasteriser from
-`oxideav-cli-convert`) flips `Scanline` to a working implementation.
+`RenderOptions` carries the framebuffer size, `ShadingMode`,
+`Projection`, `BackgroundColor`, a directional `LightSpec`, a
+`CameraSpec`, and an anti-aliasing factor (`aa ∈ 1..=8`). The default
+is 512×512, Phong shading, perspective projection.
+
+`RenderOptions::validate() -> Result<()>` runs a typed pre-flight
+check (width/height ≥ 1, `fov_deg ∈ (0, 180)`, `aa ∈ 1..=8`, finite +
+non-negative `light.intensity`, finite light/camera angles, positive
+finite `camera.distance`) and surfaces the first offending field via
+`Error::InvalidOptions(String)`. `Renderer::render` does not call it
+automatically — backends still clamp silently — so a caller wanting
+strict failure on a malformed job opts in before calling `render`.
 
 ## Output
 
-A renderer emits an `RgbaImage` (RGBA8, packed). Downstream encoders
-in the workspace (`oxideav-png`, `oxideav-mjpeg`, `oxideav-openexr`)
-consume that surface directly. `oxideav-cli-convert` handles the
-encoder dispatch — the render crate does not pull in image-encoder
-deps.
-
-Typed accessors on `RgbaImage` — `pixel(x, y)` / `set_pixel(x, y, rgba)`,
-`pixel_count()`, `is_empty()`, `pixels_rgba()` (row-major `[u8; 4]`
-iterator), `rows()` (per-row `&[u8]` slice iterator) — keep
-downstream consumers free of stride-aware byte arithmetic.
-
-## Option validation
-
-`RenderOptions::validate() -> Result<()>` runs a typed pre-flight
-check (width/height ≥ 1, `fov_deg ∈ (0, 180)`, `aa ∈ 1..=8`,
-finite + non-negative `light.intensity`, finite light/camera
-angles, positive finite `camera.distance`) and surfaces the first
-offending field via the `Error::InvalidOptions(String)` variant.
-`Renderer::render` does **not** call it automatically — backends
-still clamp silently — so a caller wanting strict failure on a
-malformed job graph opts in before calling `render`.
+A renderer emits an `RgbaImage` (RGBA8, packed). Typed accessors keep
+downstream consumers free of stride-aware byte arithmetic:
+`pixel(x, y)` / `set_pixel(x, y, rgba)`, `pixel_count()`,
+`is_empty()`, `pixels_rgba()` (row-major `[u8; 4]` iterator), and
+`rows()` (per-row `&[u8]` slice iterator). Downstream encoders
+(`oxideav-png`, `oxideav-mjpeg`, `oxideav-openexr`) consume the
+surface directly; `oxideav-cli-convert` handles encoder dispatch, so
+this crate pulls in no image-encoder deps.
 
 ## Standalone build
 
@@ -77,13 +78,13 @@ The 3D input type stays `oxideav_mesh3d::Scene3D`.
 
 ## Clean-room policy
 
-Render math is sourced from published academic papers (Möller–
-Trumbore 1997, Burley 2012 SIGGRAPH course, Kajiya 1986). Reference
-renderer source code (PBRT, Cycles, EEVEE, Embree, OptiX, Mitsuba,
-`.blend` file format) is **not** consulted at any phase. glTF KHR
-extensions provide the material vocabulary; downstream encoder
-crosswalk uses the existing oxideav PNG / OpenEXR / video crates.
+Render math is sourced from published academic papers. Reference
+renderer source code is not consulted. glTF KHR extensions provide the
+material vocabulary.
 
 ## License
 
 MIT — see `LICENSE`.
+
+[`oxideav_mesh3d::Scene3D`]: https://docs.rs/oxideav-mesh3d
+[`RgbaImage`]: https://docs.rs/oxideav-render
