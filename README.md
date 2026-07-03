@@ -1,5 +1,7 @@
 # oxideav-render
 
+[![CI](https://github.com/OxideAV/oxideav-render/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-render/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-render.svg)](https://crates.io/crates/oxideav-render) [![docs.rs](https://docs.rs/oxideav-render/badge.svg)](https://docs.rs/oxideav-render) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust 3D-scene → raster image renderer for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Consumes an [`oxideav_mesh3d::Scene3D`] and produces a packed RGBA8
