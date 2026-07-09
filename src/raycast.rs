@@ -367,6 +367,11 @@ fn bake_primitive(
 /// ray tracing. Honours the same option surface as the scanline
 /// backend: framebuffer size, background, shading mode, projection,
 /// FOV, light, camera override, and SSAA factor.
+///
+/// Rows are traced in parallel across `available_parallelism()`
+/// bands (std scoped threads, no extra dependency). Each band owns a
+/// disjoint slice of the output, so the image is deterministic —
+/// bit-identical across runs and thread counts.
 pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
     let width = opts.width.max(1);
     let height = opts.height.max(1);
@@ -382,16 +387,43 @@ pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
     let mode = opts.shading;
 
     let (w_us, h_us) = (render_w as usize, render_h as usize);
-    let mut pixels = Vec::with_capacity(w_us * h_us * 4);
     let (wf, hf) = (render_w as f32, render_h as f32);
-    for y in 0..h_us {
-        for x in 0..w_us {
-            let (origin, dir) = camera.primary_ray(x as f32 + 0.5, y as f32 + 0.5, wf, hf);
-            let ray = Ray::new(origin, dir);
-            let px = trace_pixel(&traced, &camera, &light, ray, mode, background);
-            pixels.extend_from_slice(&px);
+
+    // Rows are traced in parallel bands over std scoped threads —
+    // every band owns a disjoint `&mut` slice of the output buffer,
+    // so the result is bit-identical to the sequential order
+    // regardless of scheduling (no accumulation, no shared state).
+    // Small renders collapse to one band; no thread is spawned for
+    // the last band (traced on the caller's thread).
+    let mut pixels = vec![0u8; w_us * h_us * 4];
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, h_us.max(1));
+    let band_rows = h_us.div_ceil(threads).max(1);
+    let row_bytes = w_us * 4;
+    let trace_band = |band_idx: usize, band: &mut [u8]| {
+        let y0 = band_idx * band_rows;
+        for (row_i, row) in band.chunks_mut(row_bytes).enumerate() {
+            let y = (y0 + row_i) as f32 + 0.5;
+            for (x, px_out) in row.chunks_mut(4).enumerate() {
+                let (origin, dir) = camera.primary_ray(x as f32 + 0.5, y, wf, hf);
+                let ray = Ray::new(origin, dir);
+                let px = trace_pixel(&traced, &camera, &light, ray, mode, background);
+                px_out.copy_from_slice(&px);
+            }
         }
-    }
+    };
+    std::thread::scope(|scope| {
+        let mut bands = pixels.chunks_mut(band_rows * row_bytes).enumerate();
+        let last = bands.next_back();
+        for (band_idx, band) in bands {
+            scope.spawn(move || trace_band(band_idx, band));
+        }
+        if let Some((band_idx, band)) = last {
+            trace_band(band_idx, band);
+        }
+    });
 
     let img = RgbaImage {
         width: render_w,
@@ -1393,6 +1425,24 @@ mod tests {
             .filter(|p| *p != [255, 255, 255, 255])
             .all(|p| p[1] == 0 && p[2] == 0);
         assert!(clean_channels, "emission must not leak across channels");
+    }
+
+    #[test]
+    fn parallel_render_is_deterministic() {
+        // The banded parallel loop must be bit-identical across
+        // runs — disjoint output slices, no shared accumulation.
+        let scene = unit_triangle_scene();
+        let opts = RenderOptions {
+            width: 64,
+            height: 47, // deliberately not a multiple of any band size
+            shading: ShadingMode::Phong,
+            background: WHITE_BG,
+            ..RenderOptions::default()
+        };
+        let a = render_scene(&scene, &opts);
+        let b = render_scene(&scene, &opts);
+        assert_eq!(a.pixels, b.pixels);
+        assert_eq!(a.pixels.len(), 64 * 47 * 4);
     }
 
     #[test]

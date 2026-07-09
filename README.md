@@ -86,9 +86,10 @@ The 3D input type stays `oxideav_mesh3d::Scene3D`.
 `benches/render.rs` (criterion) tracks both backends on procedural
 scenes; baseline numbers + analysis live in
 [`BENCHMARKS.md`](BENCHMARKS.md). Headline: on a 960-triangle sphere
-at 256×256 Phong, the rasteriser takes ~2.4 ms and the Whitted ray
-tracer ~20 ms (single-threaded, shadow rays included); the BVH keeps
-raycast triangle-scaling logarithmic (4× triangles → 1.33× time).
+at 256×256 Phong, the rasteriser takes ~2.4 ms (single-threaded) and
+the Whitted ray tracer ~2.6 ms (row-parallel over std scoped
+threads, shadow rays included, deterministic output); the BVH keeps
+raycast triangle-scaling logarithmic.
 
 ## Clean-room policy
 

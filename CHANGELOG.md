@@ -72,6 +72,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the untapped optimisation headroom are documented in
   `BENCHMARKS.md`.
 
+### Changed
+
+- **Raycast renders rows in parallel bands** across
+  `available_parallelism()` std scoped threads (no new dependency).
+  Each band owns a disjoint slice of the output buffer, so the image
+  stays bit-identical across runs and thread counts (pinned by a
+  determinism test). Measured on the criterion suite: the 960-triangle
+  Phong head-to-head drops 20.1 ms → 2.57 ms (−88%), landing the ray
+  tracer within ~7% of the single-threaded rasteriser on the same
+  scene; all raycast rows improve 73–88%. A near-child-first ordered
+  BVH traversal was also tried and measured 8–13% *slower* at these
+  scene sizes — kept out; the negative result is recorded in
+  `BENCHMARKS.md`.
+
 ### Fixed
 
 - **Scene-graph walks are now cycle-safe and depth-unbounded.** The
