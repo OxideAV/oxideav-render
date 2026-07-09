@@ -6,9 +6,9 @@ use crate::error::{Error, Result};
 /// Backend selector used by [`crate::make_renderer`].
 ///
 /// Phase A shipped the selector with no working backend. Phase B
-/// fills in `Scanline`. Phase D adds `Raycast` (Whitted-style primary +
-/// shadow + reflection / refraction). Phase E adds `PathTrace` (Kajiya
-/// unbiased path tracing).
+/// filled in `Scanline`. Phase D fills in `Raycast` (Whitted-style
+/// primary + shadow + reflection / refraction). Phase E adds
+/// `PathTrace` (Kajiya unbiased path tracing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RenderBackend {
@@ -17,6 +17,12 @@ pub enum RenderBackend {
     /// with a per-pixel z-buffer. Fast, no global illumination, no
     /// raytraced shadows.
     Scanline,
+    /// Whitted recursive ray tracer — same shading-mode surface as
+    /// `Scanline`, plus (in `Phong` mode) raytraced hard shadows and
+    /// recursive reflection / refraction driven by material
+    /// metallic / roughness / transmission / IOR. Line and point
+    /// topologies have no surface area and are invisible to rays.
+    Raycast,
 }
 
 /// Shading model selector consumed by the scanline backend.
@@ -281,12 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn backend_enum_phase_b_only_has_scanline() {
-        // Compile-time pin — adding a variant before Phase D should fail
-        // a CI test that round-trips every variant. Phase D removes
-        // this restriction.
-        match RenderBackend::Scanline {
-            RenderBackend::Scanline => {}
+    fn backend_enum_phase_d_has_scanline_and_raycast() {
+        // Compile-time pin: both live backends stay constructible and
+        // distinct. Phase E extends this with `PathTrace`.
+        assert_ne!(RenderBackend::Scanline, RenderBackend::Raycast);
+        for backend in [RenderBackend::Scanline, RenderBackend::Raycast] {
+            assert!(crate::make_renderer(backend).is_ok(), "{backend:?}");
         }
     }
 

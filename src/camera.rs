@@ -109,9 +109,6 @@ fn accumulate_node_bbox(scene: &Scene3D, id: NodeId, parent_world: [[f32; 4]; 4]
 
 /// Framed camera — projection matrices for the rasteriser plus the
 /// retained placement for per-pixel ray generation.
-// TODO(raycast): the `dead_code` allow comes off when the raycast
-// backend (the ray-generation consumer) lands in the next milestone.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Camera {
     /// World → view matrix (rows are the camera basis).
@@ -140,7 +137,6 @@ pub(crate) struct Camera {
     pub(crate) half_h: f32,
 }
 
-#[allow(dead_code)] // TODO(raycast): consumed by the raycast backend next milestone.
 impl Camera {
     /// Build a camera honouring [`RenderOptions::camera`] /
     /// [`RenderOptions::projection`] / [`RenderOptions::fov_deg`].

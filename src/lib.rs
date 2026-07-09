@@ -1,27 +1,30 @@
 //! # oxideav-render
 //!
-//! **Status:** Phase B — scanline backend live (2026-06-07).
+//! **Status:** Phase D — scanline + Whitted raycast backends live.
 //!
 //! Pure-Rust 3D-scene → raster image/video renderer for the
 //! [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 //! Phase A shipped the [`Renderer`] trait, [`RenderBackend`] selector,
 //! [`RenderOptions`] surface, [`RgbaImage`] output type, and the
-//! [`make_renderer`] factory contract. Phase B fills `Scanline` in
+//! [`make_renderer`] factory contract. Phase B filled `Scanline` in
 //! with a half-space-edge-function rasteriser supporting Flat /
 //! Gouraud / Phong / Wireframe shading plus NormalDebug and DepthDebug
 //! visualisations, SSAA (1..=8), perspective and orthographic
 //! projection, auto-frame or orbit camera, and a single directional
-//! light with ambient. Raycast and path-tracer backends land in Phases
-//! D and E.
+//! light with ambient. Phase C bridged the renderer into
+//! `oxideav-pipeline` via `RenderSource`. Phase D fills `Raycast`
+//! in with a BVH-accelerated Whitted recursive ray tracer covering
+//! the same option surface plus raytraced hard shadows and recursive
+//! reflection / refraction. The path-tracer backend lands in Phase E.
 //!
 //! ## Roadmap
 //!
 //! | Phase | Surface added                                                                |
 //! |-------|-------------------------------------------------------------------------------|
 //! | A     | `Renderer` trait + `RenderBackend::Scanline` + `make_renderer` stub.          |
-//! | B *(now)* | Scanline backend (Gouraud / Phong / Wireframe / Flat / NormalDebug / Depth). |
+//! | B     | Scanline backend (Gouraud / Phong / Wireframe / Flat / NormalDebug / Depth).  |
 //! | C     | `oxideav-pipeline` `DagNode::Render3D` source — emits `Frame::Video`.         |
-//! | D     | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
+//! | D *(now)* | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
 //! | E     | `RenderBackend::PathTrace` — Kajiya path tracing + Disney/Burley BRDF.        |
 //!
 //! ## Quick start
@@ -62,6 +65,7 @@ pub mod error;
 pub mod image;
 mod math;
 pub mod options;
+mod raycast;
 pub mod registry;
 mod scanline;
 mod shade;
@@ -103,11 +107,13 @@ pub trait Renderer: Send {
 
 /// Construct a renderer for `backend`.
 ///
-/// Phase B routes `Scanline` to the in-tree scanline backend.
-/// Phases D and E fill in `Raycast` and `PathTrace`.
+/// Phase B routes `Scanline` to the in-tree scanline backend; Phase D
+/// routes `Raycast` to the Whitted ray tracer. Phase E fills in
+/// `PathTrace`.
 pub fn make_renderer(backend: RenderBackend) -> Result<Box<dyn Renderer>> {
     match backend {
         RenderBackend::Scanline => Ok(Box::new(ScanlineRenderer::new())),
+        RenderBackend::Raycast => Ok(Box::new(RaycastRenderer::new())),
     }
 }
 
@@ -138,6 +144,39 @@ impl Renderer for ScanlineRenderer {
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
         Ok(scanline::render_scene(scene, opts))
+    }
+}
+
+/// Whitted recursive ray tracer — closest-hit shading through a
+/// BVH-accelerated world-space triangle soup, with raytraced hard
+/// shadows and recursive reflection / refraction in
+/// [`ShadingMode::Phong`]. See [`raycast`](crate::options::RenderBackend::Raycast)
+/// for the capability envelope.
+///
+/// Constructed via [`make_renderer`] (recommended) or directly. The
+/// scene is baked (flattened + BVH-built) once per `render` call, so
+/// re-rendering the same scene re-bakes; per-frame scene mutation is
+/// therefore free of stale-acceleration hazards.
+#[derive(Debug, Default)]
+pub struct RaycastRenderer {
+    _priv: (),
+}
+
+impl RaycastRenderer {
+    /// Construct a fresh raycast renderer (state-free — the trace
+    /// scene and framebuffer are per-`render` allocations).
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+}
+
+impl Renderer for RaycastRenderer {
+    fn render(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<RgbaImage> {
+        Ok(raycast::render_scene(scene, opts))
     }
 }
 

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`RenderBackend::Raycast` — Phase D Whitted ray tracer.**
+  `make_renderer(RenderBackend::Raycast)` returns a live
+  `RaycastRenderer`; the `RenderRegistry` built-ins now include
+  `"raycast"` alongside `"scanline"`. The backend flattens the scene
+  graph once per render into a world-space triangle soup (strips /
+  fans pre-unrolled with correct winding, per-vertex or face normals,
+  per-triangle material slots), builds an `oxideav_mesh3d::Bvh` over
+  it, and walks the BVH allocation-free per ray. All six
+  `ShadingMode`s are honoured: `Flat` (unlit base colour, pixel-exact
+  with the scanline backend), `Gouraud` (per-vertex lighting
+  interpolated barycentrically), `Phong` (full Whitted: per-pixel
+  lighting + raytraced hard shadows + recursive reflection driven by
+  material metallic/roughness with a Schlick Fresnel weight +
+  refraction driven by `KHR_materials_transmission` /
+  `KHR_materials_ior` with total-internal-reflection fallback, depth
+  cap 4), `Wireframe` (barycentric edge-band detection),
+  `NormalDebug`, and `DepthDebug` (hit depth mapped onto the
+  projection's NDC scale, matching the rasteriser's colour key).
+  Camera framing, light, background, SSAA (`aa` 1..=8), and both
+  projections behave identically to the scanline backend — a
+  cross-backend test pins per-pixel coverage agreement. Line / point
+  topologies have no surface area and are invisible to rays.
 - **`RgbaImage` typed accessors** — `set_pixel(x, y, rgba) -> bool`
   mirror of the existing `pixel(x, y)` getter, `pixel_count() -> u64`,
   `is_empty() -> bool`, `pixels_rgba()` iterator yielding `[u8; 4]`

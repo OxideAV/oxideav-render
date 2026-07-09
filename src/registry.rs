@@ -94,14 +94,18 @@ impl std::fmt::Debug for RenderRegistry {
 
 /// Populate `reg` with every built-in backend.
 ///
-/// Phase B ships the scanline rasteriser; Phases D + E will add
-/// `"raycast"` and `"pathtrace"` here. The string keys are the
+/// Phase B shipped the scanline rasteriser, Phase D the Whitted ray
+/// tracer; Phase E will add `"pathtrace"`. The string keys are the
 /// JSON-graph convention used by `oxideav-pipeline`'s
 /// `DagNode::Render3D` — lowercase, no `RenderBackend::` prefix.
 pub fn register_into(reg: &mut RenderRegistry) {
     reg.register(
         "scanline",
         Box::new(|| crate::make_renderer(RenderBackend::Scanline)),
+    );
+    reg.register(
+        "raycast",
+        Box::new(|| crate::make_renderer(RenderBackend::Raycast)),
     );
 }
 
@@ -123,14 +127,33 @@ mod tests {
     }
 
     #[test]
-    fn register_into_exposes_scanline() {
+    fn register_into_exposes_scanline_and_raycast() {
         let mut reg = RenderRegistry::new();
         register_into(&mut reg);
         let names = reg.names();
-        assert!(
-            names.contains(&"scanline"),
-            "register_into must register \"scanline\", got {names:?}"
-        );
+        for expected in ["scanline", "raycast"] {
+            assert!(
+                names.contains(&expected),
+                "register_into must register \"{expected}\", got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn make_raycast_constructs_working_backend() {
+        let mut reg = RenderRegistry::new();
+        register_into(&mut reg);
+        let mut renderer = reg
+            .make("raycast")
+            .expect("registry must hand back a raycast renderer");
+        let scene = oxideav_mesh3d::Scene3D::new();
+        let opts = RenderOptions {
+            width: 4,
+            height: 4,
+            ..RenderOptions::default()
+        };
+        let img = renderer.render(&scene, &opts).expect("render must succeed");
+        assert_eq!((img.width, img.height), (4, 4));
     }
 
     #[test]

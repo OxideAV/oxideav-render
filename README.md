@@ -9,20 +9,23 @@ Consumes an [`oxideav_mesh3d::Scene3D`] and produces a packed RGBA8
 
 ## Status
 
-The **scanline backend** is implemented and working:
-`make_renderer(RenderBackend::Scanline)` returns a live renderer
-backed by a half-space edge-function rasteriser with a per-pixel
-z-buffer. Raytraced and path-traced backends are not yet implemented.
+Two live backends behind one trait:
 
 | Backend     | Status                                                       |
 | ----------- | ----------------------------------------------------------- |
 | `Scanline`  | done — Gouraud / Phong / Flat / Wireframe / NormalDebug / DepthDebug shading, perspective + orthographic projection, directional light |
-| `Raycast`   | not yet — Whitted primary + shadow + reflection / refraction |
+| `Raycast`   | done — Whitted recursive ray tracer: same six shading modes + raytraced hard shadows, recursive reflection (metallic / roughness, Schlick Fresnel) and refraction (transmission / IOR, TIR fallback) in `Phong` mode; BVH-accelerated |
 | `PathTrace` | not yet — path tracing + physically-based BRDF              |
 
-The scanline backend has no global illumination and no raytraced
-shadows. Pipeline integration (an `oxideav-pipeline` frame source) is
-a follow-up.
+Both backends share camera framing, light resolution, and sRGB
+output encoding, so a scene renders with matching coverage and
+colours from either; `Flat` mode is pixel-exact across the two. The
+raycast backend bakes the scene graph into a world-space triangle
+soup once per render and traverses an [`oxideav_mesh3d::Bvh`]
+allocation-free per ray. Line / point topologies have no surface
+area and are invisible to rays — the scanline backend remains the
+renderer for wire/point content. The scanline backend has no global
+illumination and no raytraced shadows.
 
 ## Usage
 
@@ -89,4 +92,5 @@ material vocabulary.
 MIT — see `LICENSE`.
 
 [`oxideav_mesh3d::Scene3D`]: https://docs.rs/oxideav-mesh3d
+[`oxideav_mesh3d::Bvh`]: https://docs.rs/oxideav-mesh3d
 [`RgbaImage`]: https://docs.rs/oxideav-render
