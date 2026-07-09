@@ -87,6 +87,12 @@ struct ShadeMaterial {
     transmission: f32,
     /// Index of refraction (`KHR_materials_ior`, default 1.5).
     ior: f32,
+    /// Linear-space emission added after the diffuse term —
+    /// `emissive_factor × KHR_materials_emissive_strength`.
+    emissive: [f32; 3],
+    /// `KHR_materials_unlit` — constant-shade the base colour;
+    /// lighting, shadows, and secondary rays are all skipped.
+    unlit: bool,
 }
 
 impl ShadeMaterial {
@@ -100,6 +106,8 @@ impl ShadeMaterial {
             roughness: 1.0,
             transmission: 0.0,
             ior: 1.5,
+            emissive: [0.0, 0.0, 0.0],
+            unlit: false,
         }
     }
 
@@ -115,6 +123,15 @@ impl ShadeMaterial {
                 .map(|t| t.factor.clamp(0.0, 1.0))
                 .unwrap_or(0.0),
             ior: m.ext.ior.unwrap_or(1.5).max(1.0),
+            emissive: {
+                let strength = m.ext.emissive_strength.unwrap_or(1.0).max(0.0);
+                [
+                    m.emissive_factor[0] * strength,
+                    m.emissive_factor[1] * strength,
+                    m.emissive_factor[2] * strength,
+                ]
+            },
+            unlit: m.ext.unlit,
         }
     }
 }
@@ -473,6 +490,12 @@ fn trace_whitted(
     depth: u32,
 ) -> [f32; 4] {
     let material = *traced.hit_material(hit);
+    // `KHR_materials_unlit`: constant shade from the base colour
+    // alone — no lighting, no shadow ray, no secondary rays (all
+    // lighting-dependent inputs are ignored per the extension).
+    if material.unlit {
+        return material.base_color;
+    }
     // Orient the interpolated normal against the incident ray so
     // lighting and secondary-ray geometry stay on the struck side.
     // The authored (or face) normal is the shading truth — geometric
@@ -492,12 +515,19 @@ fn trace_whitted(
     // Direct lighting with a shadow ray toward the light. An occluded
     // surface keeps only the ambient term.
     let shadow_origin = vec3_add(point, vec3_scale(normal, RAY_EPSILON));
-    let lit = if traced.any_hit(Ray::new(shadow_origin, light.direction), f32::INFINITY) {
+    let mut lit = if traced.any_hit(Ray::new(shadow_origin, light.direction), f32::INFINITY) {
         let a = material.base_color;
         [a[0] * AMBIENT, a[1] * AMBIENT, a[2] * AMBIENT, a[3]]
     } else {
         shade_pixel(material.base_color, normal, light)
     };
+    // Additive emission (`emissive_factor × emissive_strength`) —
+    // self-illumination on top of the diffuse term, unaffected by
+    // shadowing. The sRGB encode clamps; >1 strengths saturate
+    // toward white exactly as an SDR surface should.
+    for (l, e) in lit.iter_mut().zip(material.emissive.iter()) {
+        *l += e;
+    }
 
     if depth >= MAX_DEPTH {
         return lit;
@@ -1229,6 +1259,140 @@ mod tests {
             o[0].abs_diff(o[1]) < 30,
             "opaque pane must stay neutral, got {o:?}"
         );
+    }
+
+    #[test]
+    fn unlit_material_ignores_light_and_shadow() {
+        // An unlit triangle renders its exact base colour even when
+        // the light grazes it; the same geometry with a lit material
+        // shades darker.
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]];
+        prim.normals = Some(vec![[0.0, 0.0, 1.0]; 3]);
+        prim.material = Some(MaterialId(0));
+
+        let base = [0.3, 0.8, 0.2, 1.0];
+        let mut unlit_mat = Material {
+            base_color: base,
+            metallic: 0.0,
+            roughness: 1.0,
+            ..Material::new()
+        };
+        unlit_mat.ext.unlit = true;
+        let lit_mat = Material {
+            base_color: base,
+            metallic: 0.0,
+            roughness: 1.0,
+            ..Material::new()
+        };
+
+        // Light nearly opposite the surface normal.
+        let opts = RenderOptions {
+            width: 32,
+            height: 32,
+            shading: ShadingMode::Phong,
+            background: WHITE_BG,
+            light: crate::options::LightSpec {
+                azimuth_deg: 180.0,
+                elevation_deg: 0.0,
+                intensity: 1.0,
+            },
+            ..RenderOptions::default()
+        };
+
+        let render_mat = |mat: Material| -> RgbaImage {
+            let mut scene = Scene3D::new();
+            scene.materials.push(mat);
+            push_mesh_node(&mut scene, prim.clone());
+            render_scene(&scene, &opts)
+        };
+
+        let unlit_img = render_mat(unlit_mat);
+        let lit_img = render_mat(lit_mat);
+        let expected = linear_rgba_to_srgb_u8(base);
+        let unlit_painted: Vec<[u8; 4]> = unlit_img
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| *p != [255, 255, 255, 255])
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(!unlit_painted.is_empty());
+        for p in &unlit_painted {
+            assert_eq!(*p, expected, "unlit surface must be the exact base colour");
+        }
+        let lit_darker = lit_img
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| *p != [255, 255, 255, 255])
+            .all(|p| p[1] < expected[1]);
+        assert!(
+            lit_darker,
+            "the lit control must shade darker than the unlit base colour"
+        );
+    }
+
+    #[test]
+    fn emissive_material_self_illuminates() {
+        // Black base + red emission: the surface must glow red, and
+        // halving KHR_materials_emissive_strength must dim it.
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]];
+        prim.normals = Some(vec![[0.0, 0.0, 1.0]; 3]);
+        prim.material = Some(MaterialId(0));
+
+        let emissive_mat = |strength: Option<f32>| -> Material {
+            let mut m = Material {
+                base_color: [0.0, 0.0, 0.0, 1.0],
+                metallic: 0.0,
+                roughness: 1.0,
+                emissive_factor: [0.5, 0.0, 0.0],
+                ..Material::new()
+            };
+            m.ext.emissive_strength = strength;
+            m
+        };
+
+        let opts = RenderOptions {
+            width: 32,
+            height: 32,
+            shading: ShadingMode::Phong,
+            background: WHITE_BG,
+            ..RenderOptions::default()
+        };
+        let render_mat = |mat: Material| -> RgbaImage {
+            let mut scene = Scene3D::new();
+            scene.materials.push(mat);
+            push_mesh_node(&mut scene, prim.clone());
+            render_scene(&scene, &opts)
+        };
+
+        let full = render_mat(emissive_mat(None)); // strength default 1.0
+        let dim = render_mat(emissive_mat(Some(0.5)));
+        let max_red = |img: &RgbaImage| -> u8 {
+            img.pixels
+                .chunks_exact(4)
+                .filter(|p| *p != [255, 255, 255, 255])
+                .map(|p| p[0])
+                .max()
+                .unwrap_or(0)
+        };
+        let full_red = max_red(&full);
+        let dim_red = max_red(&dim);
+        let expected_full = crate::shade::linear_to_srgb_u8(0.5);
+        let expected_dim = crate::shade::linear_to_srgb_u8(0.25);
+        assert_eq!(full_red, expected_full, "emission must reach the pixel");
+        assert_eq!(
+            dim_red, expected_dim,
+            "emissive_strength must scale the emission"
+        );
+        // Green / blue channels stay black (base colour is black,
+        // emission is pure red).
+        let clean_channels = full
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| *p != [255, 255, 255, 255])
+            .all(|p| p[1] == 0 && p[2] == 0);
+        assert!(clean_channels, "emission must not leak across channels");
     }
 
     #[test]
