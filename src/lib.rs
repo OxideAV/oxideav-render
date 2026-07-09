@@ -57,11 +57,14 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod camera;
 pub mod error;
 pub mod image;
+mod math;
 pub mod options;
 pub mod registry;
 mod scanline;
+mod shade;
 
 #[cfg(feature = "registry")]
 pub mod source;

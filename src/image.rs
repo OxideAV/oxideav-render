@@ -126,6 +126,51 @@ impl RgbaImage {
     }
 }
 
+// ---------------------------------------------------------------------
+// SSAA downsample — shared by every backend.
+// ---------------------------------------------------------------------
+
+/// Box-filter `src` (which is `aa × dst_w` by `aa × dst_h`) down to
+/// `dst_w × dst_h`. Each output pixel averages `aa²` source pixels in
+/// straight linear-byte space — no gamma round-trip. Backends render
+/// at the supersampled resolution and hand the result here.
+pub(crate) fn downsample_box(src: &RgbaImage, dst_w: u32, dst_h: u32, aa: u32) -> RgbaImage {
+    let aa = aa.max(1);
+    let aa_us = aa as usize;
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let src_stride = src.stride;
+    let mut pixels = Vec::with_capacity(dst_w_us * dst_h_us * 4);
+    let div = (aa_us * aa_us) as u32;
+    for dy in 0..dst_h_us {
+        let sy0 = dy * aa_us;
+        for dx in 0..dst_w_us {
+            let sx0 = dx * aa_us;
+            let mut acc = [0u32; 4];
+            for j in 0..aa_us {
+                let row_base = (sy0 + j) * src_stride + sx0 * 4;
+                for i in 0..aa_us {
+                    let p = row_base + i * 4;
+                    acc[0] += src.pixels[p] as u32;
+                    acc[1] += src.pixels[p + 1] as u32;
+                    acc[2] += src.pixels[p + 2] as u32;
+                    acc[3] += src.pixels[p + 3] as u32;
+                }
+            }
+            pixels.push((acc[0] / div) as u8);
+            pixels.push((acc[1] / div) as u8);
+            pixels.push((acc[2] / div) as u8);
+            pixels.push((acc[3] / div) as u8);
+        }
+    }
+    RgbaImage {
+        width: dst_w,
+        height: dst_h,
+        stride: dst_w_us * 4,
+        pixels,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +295,35 @@ mod tests {
     fn pixels_rgba_count_matches_pixel_count() {
         let img = RgbaImage::filled(7, 5, [0; 4]);
         assert_eq!(img.pixels_rgba().count() as u64, img.pixel_count());
+    }
+
+    #[test]
+    fn downsample_box_averages_uniform_field() {
+        let src = RgbaImage::filled(4, 4, [200, 100, 50, 255]);
+        let dst = downsample_box(&src, 2, 2, 2);
+        assert_eq!(dst.width, 2);
+        assert_eq!(dst.height, 2);
+        for px in dst.pixels.chunks_exact(4) {
+            assert_eq!(px, &[200, 100, 50, 255]);
+        }
+    }
+
+    #[test]
+    fn downsample_box_averages_split_field() {
+        let src = RgbaImage {
+            width: 2,
+            height: 2,
+            stride: 8,
+            pixels: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+            ],
+        };
+        let dst = downsample_box(&src, 1, 1, 2);
+        assert_eq!(dst.width, 1);
+        assert_eq!(dst.height, 1);
+        assert_eq!(dst.pixels[0], 127);
+        assert_eq!(dst.pixels[1], 127);
+        assert_eq!(dst.pixels[2], 127);
+        assert_eq!(dst.pixels[3], 255);
     }
 }

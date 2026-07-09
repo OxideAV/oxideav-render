@@ -10,43 +10,30 @@
 //! Migration provenance: the algorithms here were authored in
 //! `oxideav-cli-convert/src/mesh3d_render.rs` (round 44 + 45 in that
 //! crate) and moved verbatim into this crate in Phase B so the renderer
-//! lives behind a stable trait. The only structural change is the
-//! caller-facing options struct — [`Mesh3DOptions`] from cli-convert
-//! becomes the framework-wide [`RenderOptions`] defined in
-//! [`crate::options`].
+//! lives behind a stable trait. Phase D split the backend-agnostic
+//! camera framing ([`crate::camera`]), vector/matrix maths
+//! ([`crate::math`]), and shading/colour helpers ([`crate::shade`])
+//! into shared modules consumed by both this backend and the raycast
+//! backend.
 //!
 //! Clean-room policy: every algorithm here has a textbook source.
 //! Half-space edge-function rasterisation traces to Pineda's 1988
 //! SIGGRAPH paper "A Parallel Algorithm for Polygon Rasterization".
 //! Bresenham's 1965 IBM Systems Journal paper covers the line walker.
 //! sRGB encoding follows IEC 61966-2-1. Look-at / perspective /
-//! orthographic matrices use the standard right-handed OpenGL
-//! conventions. No reference renderer source code was consulted at
-//! any stage.
-//!
-//! ## Module layout
-//!
-//! The internal sections below mirror the module split planned for a
-//! future refactor (see [`crate`] docs): camera framing, lighting,
-//! matrix helpers, scene bbox walk, framebuffer, and the per-shading-
-//! mode rasterisers. Kept in one file for now so the diff against the
-//! cli-convert original stays auditable.
+//! orthographic matrices use the standard right-handed conventions.
+//! No reference renderer source code was consulted at any stage.
 
-use oxideav_mesh3d::{Indices, Material, Node, NodeId, Primitive, Scene3D, Topology};
+use oxideav_mesh3d::{Indices, Material, NodeId, Primitive, Scene3D, Topology};
 
-use crate::image::RgbaImage;
-use crate::options::{CameraSpec, LightSpec, Projection, RenderOptions, ShadingMode};
-
-/// Default vertical field of view in degrees (perspective projection).
-/// Mirrors [`RenderOptions::default`]; redeclared as a constant here so
-/// the auto-frame math stays readable when called with a custom FOV.
-#[allow(dead_code)]
-const DEFAULT_FOV_DEG: f32 = 60.0;
-
-/// Constant ambient term added to every shaded pixel so back-faces
-/// stay visible at the price of contrast. Matches the typical
-/// software-renderer baseline (textbook Phong-with-ambient).
-const AMBIENT: f32 = 0.2;
+use crate::camera::{scene_bbox, Camera};
+use crate::image::{downsample_box, RgbaImage};
+use crate::math::{
+    identity4, mat3_mul_vec3, mat4_mul, mat4_mul_point, mat4_mul_vec4, vec3_cross, vec3_normalise,
+    vec3_sub,
+};
+use crate::options::{RenderOptions, ShadingMode};
+use crate::shade::{build_light, linear_rgba_to_srgb_u8, shade_pixel, DirLight};
 
 // ---------------------------------------------------------------------
 // Public entry point.
@@ -83,50 +70,6 @@ pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
         img
     } else {
         downsample_box(&img, width, height, aa)
-    }
-}
-
-// ---------------------------------------------------------------------
-// Anti-aliasing — box-filter SSAA downsample.
-// ---------------------------------------------------------------------
-
-/// Box-filter `src` (which is `aa × dst_w` by `aa × dst_h`) down to
-/// `dst_w × dst_h`. Each output pixel averages `aa²` source pixels in
-/// straight linear-byte space — no gamma round-trip.
-fn downsample_box(src: &RgbaImage, dst_w: u32, dst_h: u32, aa: u32) -> RgbaImage {
-    let aa = aa.max(1);
-    let aa_us = aa as usize;
-    let dst_w_us = dst_w as usize;
-    let dst_h_us = dst_h as usize;
-    let src_stride = src.stride;
-    let mut pixels = Vec::with_capacity(dst_w_us * dst_h_us * 4);
-    let div = (aa_us * aa_us) as u32;
-    for dy in 0..dst_h_us {
-        let sy0 = dy * aa_us;
-        for dx in 0..dst_w_us {
-            let sx0 = dx * aa_us;
-            let mut acc = [0u32; 4];
-            for j in 0..aa_us {
-                let row_base = (sy0 + j) * src_stride + sx0 * 4;
-                for i in 0..aa_us {
-                    let p = row_base + i * 4;
-                    acc[0] += src.pixels[p] as u32;
-                    acc[1] += src.pixels[p + 1] as u32;
-                    acc[2] += src.pixels[p + 2] as u32;
-                    acc[3] += src.pixels[p + 3] as u32;
-                }
-            }
-            pixels.push((acc[0] / div) as u8);
-            pixels.push((acc[1] / div) as u8);
-            pixels.push((acc[2] / div) as u8);
-            pixels.push((acc[3] / div) as u8);
-        }
-    }
-    RgbaImage {
-        width: dst_w,
-        height: dst_h,
-        stride: dst_w_us * 4,
-        pixels,
     }
 }
 
@@ -169,27 +112,6 @@ fn primitive_colour_linear(scene: &Scene3D, prim: &Primitive) -> [f32; 4] {
         .and_then(|mid| scene.materials.get(mid.0 as usize));
     mat.map(|m: &Material| m.base_color)
         .unwrap_or([0.7, 0.7, 0.75, 1.0])
-}
-
-fn linear_rgba_to_srgb_u8(c: [f32; 4]) -> [u8; 4] {
-    [
-        linear_to_srgb_u8(c[0]),
-        linear_to_srgb_u8(c[1]),
-        linear_to_srgb_u8(c[2]),
-        (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
-}
-
-fn linear_to_srgb_u8(c: f32) -> u8 {
-    let c = c.clamp(0.0, 1.0);
-    // Single-segment approximation — matches IEC 61966-2-1 well
-    // enough for an MVP renderer.
-    let v = if c <= 0.003_130_8 {
-        12.92 * c
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    };
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 // ---------------------------------------------------------------------
@@ -659,7 +581,7 @@ fn rasterise_triangle_normal_debug(
 /// Map a single normal component in `[-1, 1]` into a `u8` colour
 /// channel via `(n + 1) / 2 * 255`. NaNs and zero-length normals fall
 /// back to `128` (the encoded zero).
-fn normal_to_byte(n: f32) -> u8 {
+pub(crate) fn normal_to_byte(n: f32) -> u8 {
     if !n.is_finite() {
         return 128;
     }
@@ -696,7 +618,7 @@ fn rasterise_triangle_depth_debug(fb: &mut Framebuffer, a: [f32; 3], b: [f32; 3]
 
 /// Map an NDC z value (`[-1, 1]`, near = -1) to a grayscale byte where
 /// near = 255 and far = 0. NaN / out-of-range values are clamped.
-fn depth_to_byte(z: f32) -> u8 {
+pub(crate) fn depth_to_byte(z: f32) -> u8 {
     if !z.is_finite() {
         return 0;
     }
@@ -711,21 +633,6 @@ fn tri_bbox(fb: &Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> (i32, i3
     let max_x = a[0].max(b[0]).max(c[0]).min(fb.width as f32 - 1.0).ceil() as i32;
     let max_y = a[1].max(b[1]).max(c[1]).min(fb.height as f32 - 1.0).ceil() as i32;
     (min_x, min_y, max_x, max_y)
-}
-
-/// Lambertian diffuse + ambient. `normal` is in world space, `light`
-/// carries a unit direction TOWARD the light. Result is in linear
-/// space, alpha pulled straight from the base colour.
-fn shade_pixel(base: [f32; 4], normal: [f32; 3], light: &DirLight) -> [f32; 4] {
-    let cos_theta = vec3_dot(normal, light.direction).max(0.0);
-    let diffuse = AMBIENT + (1.0 - AMBIENT) * cos_theta * light.intensity;
-    let factor = diffuse.clamp(0.0, 1.0);
-    [
-        base[0] * factor,
-        base[1] * factor,
-        base[2] * factor,
-        base[3],
-    ]
 }
 
 /// Bresenham line on a screen-space pair of projected vertices. Used
@@ -765,316 +672,6 @@ fn draw_line(fb: &mut Framebuffer, a: [f32; 3], b: [f32; 3], colour: [u8; 4]) {
 #[inline]
 fn edge(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-}
-
-// ---------------------------------------------------------------------
-// Light helper.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct DirLight {
-    /// Unit vector pointing TOWARD the light source from the surface.
-    direction: [f32; 3],
-    intensity: f32,
-}
-
-fn build_light(spec: LightSpec) -> DirLight {
-    let az = spec.azimuth_deg.to_radians();
-    let el = spec.elevation_deg.to_radians();
-    let cos_el = el.cos();
-    let dir = [cos_el * az.sin(), el.sin(), cos_el * az.cos()];
-    DirLight {
-        direction: vec3_normalise(dir),
-        intensity: spec.intensity,
-    }
-}
-
-// ---------------------------------------------------------------------
-// 4x4 matrix helpers (column-vector convention, row-major storage).
-// ---------------------------------------------------------------------
-
-fn identity4() -> [[f32; 4]; 4] {
-    [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    let mut out = [[0.0_f32; 4]; 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            out[i][j] =
-                a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
-        }
-    }
-    out
-}
-
-fn mat4_mul_vec4(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2] + m[0][3] * v[3],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2] + m[1][3] * v[3],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2] + m[2][3] * v[3],
-        m[3][0] * v[0] + m[3][1] * v[1] + m[3][2] * v[2] + m[3][3] * v[3],
-    ]
-}
-
-fn mat4_mul_point(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
-    let v = mat4_mul_vec4(m, [p[0], p[1], p[2], 1.0]);
-    if v[3].abs() > f32::EPSILON {
-        [v[0] / v[3], v[1] / v[3], v[2] / v[3]]
-    } else {
-        [v[0], v[1], v[2]]
-    }
-}
-
-/// Multiply the 3x3 upper-left of `m` by `v`. Used to transform
-/// directions (normals) without picking up the translation column.
-fn mat3_mul_vec3(m: &[[f32; 4]; 4], v: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
-}
-
-// ---------------------------------------------------------------------
-// Camera framing.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct Camera {
-    view: [[f32; 4]; 4],
-    proj: [[f32; 4]; 4],
-}
-
-impl Camera {
-    /// Build a camera honouring [`RenderOptions::camera`] /
-    /// [`RenderOptions::projection`] / [`RenderOptions::fov_deg`].
-    fn build(width: u32, height: u32, bbox: BBox, opts: &RenderOptions) -> Self {
-        let (cx, cy, cz) = (
-            (bbox.min[0] + bbox.max[0]) * 0.5,
-            (bbox.min[1] + bbox.max[1]) * 0.5,
-            (bbox.min[2] + bbox.max[2]) * 0.5,
-        );
-        let extent = ((bbox.max[0] - bbox.min[0]).max(bbox.max[1] - bbox.min[1]))
-            .max(bbox.max[2] - bbox.min[2])
-            .max(1.0e-3);
-        let aspect = (width.max(1) as f32) / (height.max(1) as f32);
-        let radius = extent * 0.5 * 1.2;
-
-        let projection = opts.projection;
-        let fov_y = opts.fov_deg.to_radians();
-
-        // Camera placement.
-        let (eye, dist_units) = match opts.camera {
-            Some(cam) => Self::user_orbit(cam, projection, fov_y, radius, extent, [cx, cy, cz]),
-            None => {
-                // Default: look down +Z toward -Z.
-                let dist = match projection {
-                    Projection::Perspective => radius / (fov_y * 0.5).tan(),
-                    Projection::Orthographic => extent * 1.5,
-                };
-                ([cx, cy, cz + dist], dist)
-            }
-        };
-
-        let target = [cx, cy, cz];
-        let up = [0.0, 1.0, 0.0];
-        let view = look_at(eye, target, up);
-
-        let proj = match projection {
-            Projection::Perspective => {
-                let near = (dist_units - extent).max(extent * 0.01);
-                let far = dist_units + extent * 2.0;
-                perspective(fov_y, aspect, near, far)
-            }
-            Projection::Orthographic => {
-                // Frame the full extent on the smaller axis with a
-                // 1.2x margin (matching the perspective fit).
-                let half = radius;
-                let half_w = if aspect >= 1.0 { half * aspect } else { half };
-                let half_h = if aspect >= 1.0 { half } else { half / aspect };
-                let near = (dist_units - extent * 2.0).min(-extent);
-                let far = dist_units + extent * 2.0;
-                orthographic(-half_w, half_w, -half_h, half_h, near, far)
-            }
-        };
-        Self { view, proj }
-    }
-
-    fn user_orbit(
-        cam: CameraSpec,
-        projection: Projection,
-        fov_y: f32,
-        radius: f32,
-        extent: f32,
-        center: [f32; 3],
-    ) -> ([f32; 3], f32) {
-        let el = cam.elevation_deg.to_radians();
-        let az = cam.azimuth_deg.to_radians();
-        // `cam.distance` is a multiplier of the bounding-sphere radius
-        // auto-frame distance.
-        let auto_dist = match projection {
-            Projection::Perspective => radius / (fov_y * 0.5).tan(),
-            Projection::Orthographic => extent * 1.5,
-        };
-        let dist = auto_dist * cam.distance;
-        let cos_el = el.cos();
-        let dir = [cos_el * az.sin(), el.sin(), cos_el * az.cos()];
-        let eye = [
-            center[0] + dir[0] * dist,
-            center[1] + dir[1] * dist,
-            center[2] + dir[2] * dist,
-        ];
-        (eye, dist)
-    }
-}
-
-fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
-    let f = vec3_normalise(vec3_sub(target, eye));
-    let s = vec3_normalise(vec3_cross(f, up));
-    let u = vec3_cross(s, f);
-    [
-        [s[0], s[1], s[2], -vec3_dot(s, eye)],
-        [u[0], u[1], u[2], -vec3_dot(u, eye)],
-        [-f[0], -f[1], -f[2], vec3_dot(f, eye)],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov_y * 0.5).tan();
-    let nf = 1.0 / (near - far);
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) * nf, 2.0 * far * near * nf],
-        [0.0, 0.0, -1.0, 0.0],
-    ]
-}
-
-/// Standard right-handed orthographic projection matrix (OpenGL
-/// convention; outputs `w = 1` so the perspective-divide in
-/// [`project_vertex`] is a no-op).
-fn orthographic(
-    left: f32,
-    right: f32,
-    bottom: f32,
-    top: f32,
-    near: f32,
-    far: f32,
-) -> [[f32; 4]; 4] {
-    let rl = right - left;
-    let tb = top - bottom;
-    let fne = far - near;
-    [
-        [2.0 / rl, 0.0, 0.0, -(right + left) / rl],
-        [0.0, 2.0 / tb, 0.0, -(top + bottom) / tb],
-        [0.0, 0.0, -2.0 / fne, -(far + near) / fne],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-fn vec3_normalise(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len < f32::EPSILON {
-        [0.0, 0.0, 0.0]
-    } else {
-        [v[0] / len, v[1] / len, v[2] / len]
-    }
-}
-
-// ---------------------------------------------------------------------
-// Scene bbox walk.
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct BBox {
-    min: [f32; 3],
-    max: [f32; 3],
-}
-
-impl BBox {
-    fn empty() -> Self {
-        Self {
-            min: [f32::INFINITY; 3],
-            max: [f32::NEG_INFINITY; 3],
-        }
-    }
-    fn extend(&mut self, p: [f32; 3]) {
-        for (i, &v) in p.iter().enumerate() {
-            if v < self.min[i] {
-                self.min[i] = v;
-            }
-            if v > self.max[i] {
-                self.max[i] = v;
-            }
-        }
-    }
-    fn is_empty(&self) -> bool {
-        self.min[0] > self.max[0]
-    }
-}
-
-fn scene_bbox(scene: &Scene3D) -> BBox {
-    let mut bbox = BBox::empty();
-    for &root in &scene.roots {
-        accumulate_node_bbox(scene, root, identity4(), &mut bbox);
-    }
-    if bbox.is_empty() {
-        // Centre on origin with a unit half-extent so the camera math
-        // stays finite when the scene has no geometry.
-        BBox {
-            min: [-0.5, -0.5, -0.5],
-            max: [0.5, 0.5, 0.5],
-        }
-    } else {
-        bbox
-    }
-}
-
-fn accumulate_node_bbox(scene: &Scene3D, id: NodeId, parent_world: [[f32; 4]; 4], bbox: &mut BBox) {
-    let Some(node) = scene.nodes.get(id.0 as usize) else {
-        return;
-    };
-    let world = mat4_mul(parent_world, node.transform.to_matrix());
-    if let Some(mesh_id) = node.mesh {
-        if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-            for prim in &mesh.primitives {
-                for p in &prim.positions {
-                    let v = mat4_mul_vec4(&world, [p[0], p[1], p[2], 1.0]);
-                    if v[3].abs() > f32::EPSILON {
-                        bbox.extend([v[0] / v[3], v[1] / v[3], v[2] / v[3]]);
-                    }
-                }
-            }
-        }
-    }
-    let children: Vec<NodeId> = scene
-        .nodes
-        .get(id.0 as usize)
-        .map(|n: &Node| n.children.clone())
-        .unwrap_or_default();
-    for child in children {
-        accumulate_node_bbox(scene, child, world, bbox);
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1136,7 +733,7 @@ impl Framebuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{BackgroundColor, CameraSpec};
+    use crate::options::BackgroundColor;
     use oxideav_mesh3d::{Mesh, MeshId, Node as MNode, Primitive as MPrimitive, Scene3D, Topology};
 
     fn unit_triangle_scene() -> Scene3D {
@@ -1227,49 +824,6 @@ mod tests {
         for px in img.pixels.chunks_exact(4) {
             assert_eq!(px, &[42, 7, 99, 255]);
         }
-    }
-
-    #[test]
-    fn linear_to_srgb_handles_endpoints() {
-        assert_eq!(linear_to_srgb_u8(0.0), 0);
-        assert_eq!(linear_to_srgb_u8(1.0), 255);
-    }
-
-    #[test]
-    fn camera_with_user_override_is_finite() {
-        let bbox = BBox {
-            min: [-1.0, -1.0, -1.0],
-            max: [1.0, 1.0, 1.0],
-        };
-        let opts = RenderOptions {
-            camera: Some(CameraSpec {
-                elevation_deg: 30.0,
-                azimuth_deg: 45.0,
-                distance: 1.5,
-            }),
-            ..RenderOptions::default()
-        };
-        let cam = Camera::build(64, 64, bbox, &opts);
-        for row in cam.view {
-            for v in row {
-                assert!(v.is_finite(), "camera view matrix component not finite");
-            }
-        }
-    }
-
-    #[test]
-    fn ortho_projection_matrix_has_zero_w_translation() {
-        let bbox = BBox {
-            min: [-1.0, -1.0, -1.0],
-            max: [1.0, 1.0, 1.0],
-        };
-        let opts = RenderOptions {
-            projection: Projection::Orthographic,
-            ..RenderOptions::default()
-        };
-        let cam = Camera::build(64, 64, bbox, &opts);
-        // Ortho proj's bottom row is [0, 0, 0, 1] (no perspective divide).
-        assert_eq!(cam.proj[3], [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -1408,45 +962,5 @@ mod tests {
         let img_off = render_scene(&scene, &opts_off);
         let img_one = render_scene(&scene, &opts_one);
         assert_eq!(img_off.pixels, img_one.pixels);
-    }
-
-    #[test]
-    fn downsample_box_averages_uniform_field() {
-        let src = RgbaImage {
-            width: 4,
-            height: 4,
-            stride: 16,
-            pixels: vec![
-                200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200,
-                100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100,
-                50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50,
-                255, 200, 100, 50, 255, 200, 100, 50, 255, 200, 100, 50, 255,
-            ],
-        };
-        let dst = downsample_box(&src, 2, 2, 2);
-        assert_eq!(dst.width, 2);
-        assert_eq!(dst.height, 2);
-        for px in dst.pixels.chunks_exact(4) {
-            assert_eq!(px, &[200, 100, 50, 255]);
-        }
-    }
-
-    #[test]
-    fn downsample_box_averages_split_field() {
-        let src = RgbaImage {
-            width: 2,
-            height: 2,
-            stride: 8,
-            pixels: vec![
-                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
-            ],
-        };
-        let dst = downsample_box(&src, 1, 1, 2);
-        assert_eq!(dst.width, 1);
-        assert_eq!(dst.height, 1);
-        assert_eq!(dst.pixels[0], 127);
-        assert_eq!(dst.pixels[1], 127);
-        assert_eq!(dst.pixels[2], 127);
-        assert_eq!(dst.pixels[3], 255);
     }
 }
