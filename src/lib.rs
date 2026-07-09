@@ -517,3 +517,154 @@ mod robustness_tests {
         render_ok(&scene);
     }
 }
+
+#[cfg(test)]
+mod parity_tests {
+    //! Cross-backend agreement: the scanline rasteriser and the
+    //! Whitted ray tracer share camera framing, light resolution,
+    //! shading maths, and sRGB encoding, so on scenes where their
+    //! models coincide (no occlusion, no secondary rays, uniform
+    //! per-vertex normals, camera-facing geometry) their **interior**
+    //! pixels must agree to within rounding. Edge pixels are excluded
+    //! — a rasteriser applies coverage rules at pixel centres while a
+    //! ray samples exact centres, so the outline may differ by a
+    //! pixel.
+
+    use super::*;
+    use oxideav_mesh3d::{Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology};
+
+    const BG: [u8; 4] = [255, 0, 255, 255];
+
+    /// Camera-facing triangle at the z = 0 plane with uniform
+    /// per-vertex normals — no perspective-correction skew between
+    /// screen-space and surface-space interpolation, no normal
+    /// variation across the face.
+    fn facing_triangle_scene() -> Scene3D {
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![[-0.6, -0.5, 0.0], [0.6, -0.5, 0.0], [0.0, 0.55, 0.0]];
+        prim.normals = Some(vec![[0.0, 0.0, 1.0]; 3]);
+        let mut scene = Scene3D::new();
+        scene
+            .meshes
+            .push(Mesh::new("t".to_string()).with_primitive(prim));
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        scene
+    }
+
+    fn render(backend: RenderBackend, opts: &RenderOptions) -> RgbaImage {
+        let scene = facing_triangle_scene();
+        make_renderer(backend)
+            .expect("construct")
+            .render(&scene, opts)
+            .expect("render")
+    }
+
+    /// Compare pixels whose full 3×3 neighbourhood is painted in
+    /// BOTH images; assert per-channel difference ≤ `tol` and that a
+    /// meaningful number of interior pixels exists.
+    fn assert_interior_agreement(a: &RgbaImage, b: &RgbaImage, tol: u8, label: &str) {
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        let painted = |img: &RgbaImage, x: i64, y: i64| -> bool {
+            if x < 0 || y < 0 || x >= img.width as i64 || y >= img.height as i64 {
+                return false;
+            }
+            img.pixel(x as u32, y as u32).unwrap() != BG
+        };
+        let mut interior = 0usize;
+        let mut worst = 0u8;
+        for y in 0..a.height as i64 {
+            for x in 0..a.width as i64 {
+                let all_painted = (-1..=1).all(|dy| {
+                    (-1..=1).all(|dx| painted(a, x + dx, y + dy) && painted(b, x + dx, y + dy))
+                });
+                if !all_painted {
+                    continue;
+                }
+                interior += 1;
+                let pa = a.pixel(x as u32, y as u32).unwrap();
+                let pb = b.pixel(x as u32, y as u32).unwrap();
+                for c in 0..4 {
+                    let d = pa[c].abs_diff(pb[c]);
+                    worst = worst.max(d);
+                    assert!(
+                        d <= tol,
+                        "{label}: pixel ({x}, {y}) channel {c} differs by {d} \
+                         (> {tol}): {pa:?} vs {pb:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            interior > 200,
+            "{label}: expected a substantial interior region, got {interior} pixels"
+        );
+        // `worst` is tracked so a future tolerance tightening has a
+        // measured starting point; the assert above is the gate.
+        let _ = worst;
+    }
+
+    fn opts_for(mode: ShadingMode) -> RenderOptions {
+        RenderOptions {
+            width: 96,
+            height: 96,
+            shading: mode,
+            background: BackgroundColor(BG),
+            ..RenderOptions::default()
+        }
+    }
+
+    #[test]
+    fn phong_interior_pixels_agree() {
+        let opts = opts_for(ShadingMode::Phong);
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 1, "phong");
+    }
+
+    #[test]
+    fn gouraud_interior_pixels_agree() {
+        let opts = opts_for(ShadingMode::Gouraud);
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 1, "gouraud");
+    }
+
+    #[test]
+    fn flat_interior_pixels_agree_exactly() {
+        let opts = opts_for(ShadingMode::Flat);
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 0, "flat");
+    }
+
+    #[test]
+    fn normal_debug_interior_pixels_agree() {
+        let opts = opts_for(ShadingMode::NormalDebug);
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 1, "normal-debug");
+    }
+
+    #[test]
+    fn depth_debug_interior_pixels_agree() {
+        let opts = opts_for(ShadingMode::DepthDebug);
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 2, "depth-debug");
+    }
+
+    #[test]
+    fn orthographic_phong_interior_pixels_agree() {
+        let opts = RenderOptions {
+            projection: Projection::Orthographic,
+            ..opts_for(ShadingMode::Phong)
+        };
+        let scan = render(RenderBackend::Scanline, &opts);
+        let ray = render(RenderBackend::Raycast, &opts);
+        assert_interior_agreement(&scan, &ray, 1, "ortho-phong");
+    }
+}

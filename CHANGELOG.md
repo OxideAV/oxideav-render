@@ -48,6 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently clamp) — opt-in for `oxideav-pipeline`'s `Render3D` DAG
   node which wants strict failure on a malformed job graph.
 
+- **Raycast material fidelity: `KHR_materials_unlit` + emissive.**
+  In the Whitted (`Phong`) path, an unlit material constant-shades
+  its base colour — no lighting, no shadow ray, no secondary rays —
+  and every material adds `emissive_factor ×
+  KHR_materials_emissive_strength` after the diffuse term
+  (self-illumination unaffected by shadowing; the sRGB encode
+  saturates >1 sums toward white).
+- **Cross-backend parity test suite.** On scenes where the two
+  backends' models coincide (camera-facing triangle, uniform
+  normals, no occlusion), interior pixels — full 3×3 painted
+  neighbourhood in both images — must agree within ±1/255 for Phong
+  / Gouraud / NormalDebug (±2 for DepthDebug, exact for Flat), in
+  both perspective and orthographic projection. Pins camera framing,
+  shading maths, and sRGB encoding to a single behaviour across the
+  rasteriser and the ray tracer.
 - **Criterion benchmark suite + `BENCHMARKS.md`.** `benches/render.rs`
   covers scanline-vs-raycast head-to-heads (Phong + Flat at 256×256 on
   a 960-triangle procedural UV sphere), triangle-count scaling on the
