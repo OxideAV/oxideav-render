@@ -35,3 +35,13 @@ oxideav-core = { version = "0.1", optional = true }
 # `thiserror` is a widely-used `Error` derive macro — already a
 # workspace-level dep used by several sibling crates.
 thiserror = "1"
+
+[dev-dependencies]
+# Criterion drives the backend benchmarks in `benches/render.rs`,
+# matching the bench shape the other OxideAV crates with benches
+# (png / bmp / gif / tiff / cinepak / tta / flac) already track.
+criterion = "0.5"
+
+[[bench]]
+name = "render"
+harness = false

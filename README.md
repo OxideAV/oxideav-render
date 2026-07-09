@@ -81,6 +81,15 @@ The standalone build exposes `Renderer` / `RenderOptions` /
 `RgbaImage` / `make_renderer` without the framework dependency tree.
 The 3D input type stays `oxideav_mesh3d::Scene3D`.
 
+## Benchmarks
+
+`benches/render.rs` (criterion) tracks both backends on procedural
+scenes; baseline numbers + analysis live in
+[`BENCHMARKS.md`](BENCHMARKS.md). Headline: on a 960-triangle sphere
+at 256×256 Phong, the rasteriser takes ~2.4 ms and the Whitted ray
+tracer ~20 ms (single-threaded, shadow rays included); the BVH keeps
+raycast triangle-scaling logarithmic (4× triangles → 1.33× time).
+
 ## Clean-room policy
 
 Render math is sourced from published academic papers. Reference

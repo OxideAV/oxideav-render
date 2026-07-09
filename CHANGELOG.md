@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently clamp) — opt-in for `oxideav-pipeline`'s `Render3D` DAG
   node which wants strict failure on a malformed job graph.
 
+- **Criterion benchmark suite + `BENCHMARKS.md`.** `benches/render.rs`
+  covers scanline-vs-raycast head-to-heads (Phong + Flat at 256×256 on
+  a 960-triangle procedural UV sphere), triangle-count scaling on the
+  BVH walk (~4× triangles → ~1.33× time), Whitted mirror-floor
+  recursion, SSAA 4× scaling on both backends, and an isolated
+  bake+BVH-build row (~0.21 ms at 4k triangles). Baseline numbers and
+  the untapped optimisation headroom are documented in
+  `BENCHMARKS.md`.
+
 ### Fixed
 
 - **Scene-graph walks are now cycle-safe and depth-unbounded.** The
