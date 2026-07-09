@@ -8,9 +8,11 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// Returned by Phase A `make_renderer` calls — the backend selector
-    /// is wired but the backend implementation has not landed yet.
-    /// Phase B fills in the scanline backend; Phase D adds raycast.
+    /// Reserved for backend selectors whose implementation has not
+    /// landed yet. Phase A returned this from every `make_renderer`
+    /// call; the Phase B scanline and Phase D raycast backends both
+    /// construct, so nothing returns it today — the Phase E
+    /// path-tracer selector will while it is stubbed.
     #[error("renderer backend not implemented in this phase")]
     NotImplemented,
 

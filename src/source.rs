@@ -253,6 +253,35 @@ mod tests {
     }
 
     #[test]
+    fn raycast_backend_drives_the_source_identically() {
+        // The pipeline bridge is backend-agnostic: a RenderSource
+        // built over the raycast backend must advertise the same
+        // params and deliver a painted frame, exactly like the
+        // scanline-backed source above.
+        let scene = one_triangle_scene();
+        let renderer = make_renderer(RenderBackend::Raycast).expect("raycast");
+        let opts = small_opts();
+        let mut src = RenderSource::new(scene, renderer, opts);
+        assert_eq!(src.params().codec_id.as_str(), "rawvideo");
+        let frame = src.next_frame().expect("first frame");
+        let v = match frame {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+        assert_eq!(v.planes[0].stride, 32 * 4);
+        assert_eq!(v.planes[0].data.len(), 32 * 32 * 4);
+        let any_drawn = v.planes[0]
+            .data
+            .chunks_exact(4)
+            .any(|p| p != [255, 255, 255, 255]);
+        assert!(
+            any_drawn,
+            "raycast backend must paint at least one pixel into the VideoFrame"
+        );
+        assert!(matches!(src.next_frame(), Err(CoreError::Eof)));
+    }
+
+    #[test]
     fn dimensions_round_trip_through_params() {
         // A non-square framebuffer to catch any accidental width/height
         // swap inside `RenderSource::new` or `next_frame`.
