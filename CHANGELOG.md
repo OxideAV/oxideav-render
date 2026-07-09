@@ -48,6 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently clamp) — opt-in for `oxideav-pipeline`'s `Render3D` DAG
   node which wants strict failure on a malformed job graph.
 
+### Fixed
+
+- **Scene-graph walks are now cycle-safe and depth-unbounded.** The
+  scene graph is an arena of parent → child index references, so a
+  corrupt or hostile scene can contain a self-referential node, a
+  multi-node cycle, or a diamond-shared child. Every walk in this
+  crate (camera auto-frame bbox, scanline draw, raycast bake) now
+  runs through one shared iterative pre-order traversal that claims
+  each node once at first arrival — the same contract as
+  `oxideav_mesh3d::Scene3D`'s own ray / bounds walks. Previously a
+  cyclic graph recursed forever and a ~10k-deep parent chain
+  overflowed the call stack; both now render fine (regression tests
+  cover self-cycle, two-node cycle, diamond sharing — pixel-identical
+  to the equivalent plain scene — out-of-range node/mesh ids,
+  NaN/Inf-poisoned vertices, garbage index buffers, 1×1 outputs, and
+  a 10 000-deep hierarchy on both backends).
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-render/compare/v0.0.2...v0.0.3) - 2026-06-07
 
 ### Added

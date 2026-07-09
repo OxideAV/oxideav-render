@@ -35,13 +35,13 @@
 //! remains the renderer for wire/point content).
 
 use oxideav_mesh3d::ray::{intersect_aabb, intersect_triangle, Ray};
-use oxideav_mesh3d::{Bvh, NodeId, Primitive, Scene3D, Topology};
+use oxideav_mesh3d::{Bvh, Primitive, Scene3D, Topology};
 
 use crate::camera::{scene_bbox, Camera};
 use crate::image::{downsample_box, RgbaImage};
 use crate::math::{
-    identity4, mat3_mul_vec3, mat4_mul, mat4_mul_point, vec3_add, vec3_cross, vec3_dot,
-    vec3_normalise, vec3_scale, vec3_sub,
+    mat3_mul_vec3, mat4_mul_point, vec3_add, vec3_cross, vec3_dot, vec3_normalise, vec3_scale,
+    vec3_sub,
 };
 use crate::options::{RenderOptions, ShadingMode};
 use crate::shade::{build_light, linear_rgba_to_srgb_u8, shade_pixel, DirLight, AMBIENT};
@@ -159,9 +159,19 @@ impl TraceScene {
             materials.push(ShadeMaterial::from_material(m));
         }
 
-        for &root in &scene.roots {
-            bake_node(scene, root, identity4(), &mut soup, &mut shade);
-        }
+        // Iterative pre-order walk: claims each node once at first
+        // arrival so cyclic / shared node graphs terminate, and deep
+        // hierarchies cannot overflow the call stack (see
+        // `camera::walk_scene_preorder`).
+        crate::camera::walk_scene_preorder(scene, |node, world| {
+            if let Some(mesh_id) = node.mesh {
+                if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
+                    for prim in &mesh.primitives {
+                        bake_primitive(prim, world, &mut soup, &mut shade);
+                    }
+                }
+            }
+        });
 
         let bvh = Bvh::build(&soup);
         Self {
@@ -287,31 +297,6 @@ struct Hit {
     t: f32,
     triangle: usize,
     barycentric: [f32; 3],
-}
-
-/// Append one node's primitives (world-transformed) to the soup,
-/// then recurse into children.
-fn bake_node(
-    scene: &Scene3D,
-    id: NodeId,
-    parent_world: [[f32; 4]; 4],
-    soup: &mut Primitive,
-    shade: &mut Vec<TriShade>,
-) {
-    let Some(node) = scene.nodes.get(id.0 as usize) else {
-        return;
-    };
-    let world = mat4_mul(parent_world, node.transform.to_matrix());
-    if let Some(mesh_id) = node.mesh {
-        if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-            for prim in &mesh.primitives {
-                bake_primitive(prim, &world, soup, shade);
-            }
-        }
-    }
-    for &child in &node.children {
-        bake_node(scene, child, world, soup, shade);
-    }
 }
 
 fn bake_primitive(
@@ -619,7 +604,7 @@ fn refract(d: [f32; 3], n: [f32; 3], eta: f32) -> Option<[f32; 3]> {
 mod tests {
     use super::*;
     use crate::options::BackgroundColor;
-    use oxideav_mesh3d::{Indices, Material, MaterialId, Mesh, MeshId, Node, Scene3D};
+    use oxideav_mesh3d::{Indices, Material, MaterialId, Mesh, MeshId, Node, NodeId, Scene3D};
 
     const WHITE_BG: BackgroundColor = BackgroundColor([255, 255, 255, 255]);
 

@@ -24,13 +24,12 @@
 //! orthographic matrices use the standard right-handed conventions.
 //! No reference renderer source code was consulted at any stage.
 
-use oxideav_mesh3d::{Indices, Material, NodeId, Primitive, Scene3D, Topology};
+use oxideav_mesh3d::{Indices, Material, Primitive, Scene3D, Topology};
 
 use crate::camera::{scene_bbox, Camera};
 use crate::image::{downsample_box, RgbaImage};
 use crate::math::{
-    identity4, mat3_mul_vec3, mat4_mul, mat4_mul_point, mat4_mul_vec4, vec3_cross, vec3_normalise,
-    vec3_sub,
+    mat3_mul_vec3, mat4_mul, mat4_mul_point, mat4_mul_vec4, vec3_cross, vec3_normalise, vec3_sub,
 };
 use crate::options::{RenderOptions, ShadingMode};
 use crate::shade::{build_light, linear_rgba_to_srgb_u8, shade_pixel, DirLight};
@@ -61,9 +60,20 @@ pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
     let mode = opts.shading;
 
     // Walk the node forest in pre-order, composing world matrices.
-    for &root in &scene.roots {
-        walk_node(scene, root, identity4(), &camera, &light, &mut fb, mode);
-    }
+    // The iterative walk claims each node once at first arrival so a
+    // cyclic / diamond-shaped node graph terminates and arbitrarily
+    // deep hierarchies cannot overflow the call stack (see
+    // `camera::walk_scene_preorder` for the traversal contract).
+    crate::camera::walk_scene_preorder(scene, |node, world| {
+        if let Some(mesh_id) = node.mesh {
+            if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
+                for prim in &mesh.primitives {
+                    let colour = primitive_colour_linear(scene, prim);
+                    draw_primitive(prim, world, &camera, &light, colour, &mut fb, mode);
+                }
+            }
+        }
+    });
 
     let img = fb.into_image();
     if aa <= 1 {
@@ -76,32 +86,6 @@ pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
 // ---------------------------------------------------------------------
 // Scene walk.
 // ---------------------------------------------------------------------
-
-fn walk_node(
-    scene: &Scene3D,
-    id: NodeId,
-    parent_world: [[f32; 4]; 4],
-    camera: &Camera,
-    light: &DirLight,
-    fb: &mut Framebuffer,
-    mode: ShadingMode,
-) {
-    let Some(node) = scene.nodes.get(id.0 as usize) else {
-        return;
-    };
-    let world = mat4_mul(parent_world, node.transform.to_matrix());
-    if let Some(mesh_id) = node.mesh {
-        if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-            for prim in &mesh.primitives {
-                let colour = primitive_colour_linear(scene, prim);
-                draw_primitive(prim, &world, camera, light, colour, fb, mode);
-            }
-        }
-    }
-    for &child in &node.children {
-        walk_node(scene, child, world, camera, light, fb, mode);
-    }
-}
 
 /// Linear-space (0..=1 RGBA, premultiplied alpha NOT applied) colour for
 /// a primitive. We keep the colour in linear space for shading and only

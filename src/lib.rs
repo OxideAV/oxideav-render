@@ -259,3 +259,261 @@ mod tests {
         assert!(any_drawn, "scanline backend must paint at least one pixel");
     }
 }
+
+#[cfg(test)]
+mod robustness_tests {
+    //! Degenerate / hostile scene-graph inputs, exercised through the
+    //! public trait surface on BOTH live backends. Every case here
+    //! must terminate and return a well-formed image — no panic, no
+    //! unbounded recursion.
+
+    use super::*;
+    use oxideav_mesh3d::{Indices, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology};
+
+    fn both_backends() -> [RenderBackend; 2] {
+        [RenderBackend::Scanline, RenderBackend::Raycast]
+    }
+
+    fn tiny_opts() -> RenderOptions {
+        RenderOptions {
+            width: 16,
+            height: 16,
+            background: BackgroundColor([9, 9, 9, 255]),
+            shading: ShadingMode::Flat,
+            ..RenderOptions::default()
+        }
+    }
+
+    fn triangle_mesh() -> Mesh {
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]];
+        Mesh::new("t".to_string()).with_primitive(prim)
+    }
+
+    fn render_ok(scene: &Scene3D) {
+        for backend in both_backends() {
+            let mut renderer = make_renderer(backend).expect("construct");
+            let img = renderer
+                .render(scene, &tiny_opts())
+                .expect("render must not fail");
+            assert_eq!((img.width, img.height), (16, 16), "{backend:?}");
+            assert_eq!(img.pixels.len(), 16 * 16 * 4, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn self_referential_node_terminates() {
+        // Node 0 lists itself as a child — an unguarded pre-order
+        // walk recurses forever.
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            children: vec![NodeId(0)],
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        render_ok(&scene);
+    }
+
+    #[test]
+    fn two_node_cycle_terminates() {
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            children: vec![NodeId(1)],
+            ..Node::default()
+        });
+        scene.nodes.push(Node {
+            children: vec![NodeId(0)],
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        render_ok(&scene);
+    }
+
+    #[test]
+    fn diamond_shared_child_renders_once() {
+        // Two parents share one mesh-bearing child. Traversal contract:
+        // first parent's chain claims the child; the render still
+        // paints the triangle exactly as a plain single-parent scene
+        // would (identity transforms on every node).
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        scene.nodes.push(Node {
+            children: vec![NodeId(2)],
+            ..Node::default()
+        });
+        scene.nodes.push(Node {
+            children: vec![NodeId(2)],
+            ..Node::default()
+        });
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        scene.roots.push(NodeId(1));
+
+        let mut plain = Scene3D::new();
+        plain.meshes.push(triangle_mesh());
+        plain.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        plain.roots.push(NodeId(0));
+
+        for backend in both_backends() {
+            let mut renderer = make_renderer(backend).expect("construct");
+            let diamond_img = renderer.render(&scene, &tiny_opts()).expect("render");
+            let plain_img = renderer.render(&plain, &tiny_opts()).expect("render");
+            assert_eq!(
+                diamond_img.pixels, plain_img.pixels,
+                "{backend:?}: shared child must render once, identically to the plain scene"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_node_and_mesh_ids_are_ignored() {
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(999)),
+            children: vec![NodeId(999)],
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        scene.roots.push(NodeId(12345));
+        render_ok(&scene);
+    }
+
+    #[test]
+    fn nan_positions_do_not_poison_the_render() {
+        // One healthy triangle + one NaN-poisoned triangle. The
+        // camera auto-frame must ignore the NaN vertices and both
+        // backends must still terminate cleanly.
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![
+            [-0.5, -0.5, 0.0],
+            [0.5, -0.5, 0.0],
+            [0.0, 0.5, 0.0],
+            [f32::NAN, 0.0, 0.0],
+            [0.0, f32::NAN, 0.0],
+            [f32::INFINITY, 0.0, f32::NEG_INFINITY],
+        ];
+        let mut scene = Scene3D::new();
+        scene
+            .meshes
+            .push(Mesh::new("n".to_string()).with_primitive(prim));
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+
+        for backend in both_backends() {
+            let mut renderer = make_renderer(backend).expect("construct");
+            let img = renderer.render(&scene, &tiny_opts()).expect("render");
+            let painted = img.pixels.chunks_exact(4).any(|p| p != [9, 9, 9, 255]);
+            assert!(
+                painted,
+                "{backend:?}: the healthy triangle must survive NaN siblings"
+            );
+        }
+    }
+
+    #[test]
+    fn garbage_index_buffer_is_ignored() {
+        let mut prim = Primitive::new(Topology::Triangles);
+        prim.positions = vec![[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]];
+        prim.indices = Some(Indices::U32(vec![0, 1, 2, 7, 8, 9, u32::MAX, 1, 2]));
+        let mut scene = Scene3D::new();
+        scene
+            .meshes
+            .push(Mesh::new("g".to_string()).with_primitive(prim));
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        render_ok(&scene);
+    }
+
+    #[test]
+    fn one_by_one_pixel_render_works() {
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        for backend in both_backends() {
+            let mut renderer = make_renderer(backend).expect("construct");
+            let opts = RenderOptions {
+                width: 1,
+                height: 1,
+                ..RenderOptions::default()
+            };
+            let img = renderer.render(&scene, &opts).expect("render");
+            assert_eq!((img.width, img.height), (1, 1), "{backend:?}");
+            assert_eq!(img.pixels.len(), 4, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn empty_primitive_and_empty_mesh_render_background() {
+        let mut scene = Scene3D::new();
+        scene
+            .meshes
+            .push(Mesh::new("e".to_string()).with_primitive(Primitive::new(Topology::Triangles)));
+        scene.meshes.push(Mesh::new("empty".to_string()));
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(0)),
+            ..Node::default()
+        });
+        scene.nodes.push(Node {
+            mesh: Some(MeshId(1)),
+            ..Node::default()
+        });
+        scene.roots.push(NodeId(0));
+        scene.roots.push(NodeId(1));
+        for backend in both_backends() {
+            let mut renderer = make_renderer(backend).expect("construct");
+            let img = renderer.render(&scene, &tiny_opts()).expect("render");
+            for px in img.pixels.chunks_exact(4) {
+                assert_eq!(px, &[9, 9, 9, 255], "{backend:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn deep_linear_hierarchy_terminates() {
+        // 10k-deep parent chain. The iterative pre-order walk keeps
+        // its own heap stack, so traversal depth must never touch the
+        // call stack (test threads only get 2 MiB).
+        const DEPTH: u32 = 10_000;
+        let mut scene = Scene3D::new();
+        scene.meshes.push(triangle_mesh());
+        for i in 0..DEPTH {
+            let children = if i + 1 < DEPTH {
+                vec![NodeId(i + 1)]
+            } else {
+                Vec::new()
+            };
+            scene.nodes.push(Node {
+                mesh: if i + 1 == DEPTH {
+                    Some(MeshId(0))
+                } else {
+                    None
+                },
+                children,
+                ..Node::default()
+            });
+        }
+        scene.roots.push(NodeId(0));
+        render_ok(&scene);
+    }
+}
