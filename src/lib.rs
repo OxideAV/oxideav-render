@@ -52,8 +52,7 @@
 //! Trumbore 1997 (ray-triangle intersection, Phase D), Burley 2012
 //! SIGGRAPH course (Disney BRDF, Phase E), Kajiya 1986 (path-tracing
 //! equation, Phase E) — plus IEC 61966-2-1 for sRGB encoding.
-//! Reference renderer source code (PBRT, Cycles, EEVEE, Embree, OptiX,
-//! Mitsuba, *.blend* files) is **not** consulted. glTF KHR extensions
+//! No external renderer's source code is consulted. glTF KHR extensions
 //! provide the material vocabulary; output crosswalk to PNG / OpenEXR
 //! / video uses the existing oxideav encoder crates.
 
