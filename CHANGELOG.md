@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-render/compare/v0.0.3...v0.0.4) - 2026-08-16
+
+### Added
+
+- raycast material fidelity — KHR_materials_unlit + emissive
+- RenderBackend::Raycast — Phase D Whitted recursive ray tracer
+- typed RgbaImage accessors + RenderOptions::validate
+
+### Fixed
+
+- cycle-safe, depth-unbounded scene walks via shared iterative pre-order traversal
+
+### Other
+
+- state the source-independence contract without an enumerated list
+- RenderSource drives the raycast backend; Error::NotImplemented doc reflects Phase D
+- raycast traces rows in parallel bands — 20.1 ms -> 2.57 ms (-88%) on the Phong head-to-head
+- cross-backend parity suite — interior pixels agree between backends
+- criterion suite for both backends + BENCHMARKS.md baseline
+- extract shared camera / math / shade modules + camera ray generation
+- add CI / crates.io / docs.rs / MIT-license badges
+- refresh to current status, drop per-round changelog cruft
+- drop release-plz.toml — use release-plz defaults across the workspace
+
 ### Added
 
 - **`RenderBackend::Raycast` — Phase D Whitted ray tracer.**
