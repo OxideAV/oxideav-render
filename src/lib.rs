@@ -17,6 +17,16 @@
 //! the same option surface plus raytraced hard shadows and recursive
 //! reflection / refraction. The path-tracer backend lands in Phase E.
 //!
+//! All backends sit on shared, public, backend-agnostic layers:
+//! [`prepare`] (scene → world-space render list with animation,
+//! morphs, skinning, materials, textures, lights, cameras), [`camera`]
+//! (identical framing everywhere), [`texture`] (pluggable decoding +
+//! glTF-sampler CPU sampling), [`brdf`] (glTF Appendix B), [`hdr`]
+//! (linear `f32` output + tone mapping) and [`testscenes`] (reference
+//! scenes + image metrics). The scanline backend implements the full
+//! glTF metallic-roughness model in [`ShadingMode::Pbr`] with alpha
+//! modes and shadow maps.
+//!
 //! ## Roadmap
 //!
 //! | Phase | Surface added                                                                |

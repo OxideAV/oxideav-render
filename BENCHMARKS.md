@@ -29,6 +29,28 @@ per-ray cost model).
 | `raycast_phong_960tri_aa4_128` | Raycast | 9.96 ms | 77.5 ms |
 | `raycast_bake_only_3968tri_1` | Raycast | 0.22 ms | 0.21 ms |
 
+## Prep-layer scanline + PBR (2026-10-04)
+
+x86_64 Linux, 64 hardware threads (bands capped at 8 workers), rustc
+1.98 release bench profile — a different machine from the baseline
+above, so compare rows within this table only.
+
+| Scenario | Time |
+| --- | --- |
+| `scanline_flat_960tri_256` | 2.47 ms |
+| `scanline_phong_960tri_256` | 2.64 ms |
+| `scanline_pbr_960tri_256` | 2.72 ms |
+| `scanline_pbr_shadows_960tri_256` | 6.28 ms |
+| `scanline_pbr_cornell_shadows_aa2_256` | 6.82 ms |
+| `scanline_phong_960tri_aa4_128` | 5.02 ms |
+
+The scanline backend now prepares the scene (morph / skin / bake /
+de-index), clips, writes a visibility buffer and shades each visible
+pixel once, all band-parallel. At 256² the per-pass worker spawns and
+the serial prepare + triangle setup dominate, which is why Flat, Phong
+and PBR cost about the same. Shadow maps add one 1024² depth pass per
+directional or spot light.
+
 ## Reading the numbers
 
 - **Banded row parallelism** (std scoped threads, zero new
