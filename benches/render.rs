@@ -184,6 +184,48 @@ fn benches(c: &mut Criterion) {
 
     bench_backend(
         c,
+        "raycast_pbr_960tri_256",
+        RenderBackend::Raycast,
+        &sphere,
+        &pbr256,
+    );
+    bench_backend(
+        c,
+        "raycast_pbr_shadows_960tri_256",
+        RenderBackend::Raycast,
+        &sphere,
+        &pbr_shadow256,
+    );
+    bench_backend(
+        c,
+        "raycast_pbr_cornell_shadows_aa2_256",
+        RenderBackend::Raycast,
+        &cornell,
+        &cornell_opts,
+    );
+    let grid = oxideav_render::testscenes::sphere_grid(3, 3);
+    let grid_opts = RenderOptions {
+        scene_camera: Some(0),
+        shadows: true,
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+    bench_backend(
+        c,
+        "scanline_pbr_sphere_grid_shadows_256",
+        RenderBackend::Scanline,
+        &grid,
+        &grid_opts,
+    );
+    bench_backend(
+        c,
+        "raycast_pbr_sphere_grid_reflect_shadows_256",
+        RenderBackend::Raycast,
+        &grid,
+        &grid_opts,
+    );
+
+    bench_backend(
+        c,
         "scanline_phong_960tri_256",
         RenderBackend::Scanline,
         &sphere,

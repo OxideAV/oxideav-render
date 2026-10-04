@@ -32,7 +32,7 @@
 //!   resolved against [`PreparedScene::textures`] here.
 
 use oxideav_mesh3d::ray::{PreparedRay, Ray, RayQuery, TriangleTest};
-use oxideav_mesh3d::{AlphaMode, Bvh, Primitive, TextureRef, Topology};
+use oxideav_mesh3d::{AlphaMode, Bvh, BvhBuildOptions, Primitive, TextureRef, Topology};
 
 use crate::math::{vec3_cross, vec3_dot, vec3_normalise, vec3_sub};
 use crate::prepare::{DrawItem, DrawTopology, PreparedMaterial, PreparedScene, TextureBinding};
@@ -173,6 +173,14 @@ impl TraceScene {
     /// Build the triangle soup + BVH over `prepared`'s triangle items
     /// (line / point items have no area and are not traceable).
     pub fn new(prepared: PreparedScene) -> Self {
+        Self::with_build_options(prepared, &BvhBuildOptions::default())
+    }
+
+    /// [`Self::new`] with explicit BVH construction options — e.g.
+    /// [`BvhBuildOptions::object_median`] (several times faster to build
+    /// than binned SAH, ~15 % costlier to traverse) when few rays will
+    /// be traced per triangle.
+    pub fn with_build_options(prepared: PreparedScene, options: &BvhBuildOptions) -> Self {
         let mut soup = Primitive::new(Topology::Triangles);
         let mut tri_refs = Vec::new();
         for (ii, item) in prepared.items.iter().enumerate() {
@@ -188,7 +196,7 @@ impl TraceScene {
                 });
             }
         }
-        let bvh = Bvh::build(&soup);
+        let bvh = Bvh::build_with(&soup, options);
         Self {
             prepared,
             soup,

@@ -100,7 +100,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use oxideav_mesh3d::{AlphaMode, Scene3D};
+use oxideav_mesh3d::{AlphaMode, BvhBuildOptions, Scene3D};
 
 use crate::brdf::{f_schlick, BrdfParams};
 use crate::camera::Camera;
@@ -173,7 +173,16 @@ fn render_frame(scene: &Scene3D, opts: &RenderOptions, cache: &mut TextureCache)
 
     let prepared = PreparedScene::build(scene, &PrepareOptions::from_render_options(opts), cache);
     let camera = Camera::resolve(&prepared, opts, rw, rh);
-    let ts = TraceScene::new(prepared);
+    // BVH builder: binned SAH (Wald 2007) traces ~15 % faster than an
+    // object-median split but builds ~6× slower; a Whitted frame
+    // traces only a few rays per triangle on dense meshes, so the
+    // cheaper build wins below ~16 camera samples per triangle.
+    let build = if (rw as usize * rh as usize) >= 16 * prepared.triangle_count() {
+        BvhBuildOptions::sah()
+    } else {
+        BvhBuildOptions::object_median()
+    };
+    let ts = TraceScene::with_build_options(prepared, &build);
     let ambient = if opts.ambient.is_finite() {
         opts.ambient.max(0.0)
     } else {
@@ -242,10 +251,13 @@ fn trace_tiles(w: usize, h: usize, f: impl Fn(usize, usize) -> Sample + Sync) ->
         }
         (t, v)
     };
+    // Ray tracing is compute-bound: use every hardware thread, but
+    // keep at least four tiles per worker so small renders do not pay
+    // for idle spawns.
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(n_tiles)
+        .min(n_tiles / 4)
         .max(1);
     let results: Vec<(usize, Vec<Sample>)> = if workers <= 1 {
         (0..n_tiles).map(run_tile).collect()
