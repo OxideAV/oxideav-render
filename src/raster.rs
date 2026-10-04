@@ -35,7 +35,7 @@ pub(crate) const NONE: u32 = u32::MAX;
 pub(crate) const LINE_FLAG: u32 = 0x8000_0000;
 
 /// Rows per parallel band.
-const BAND_ROWS: usize = 16;
+pub(crate) const BAND_ROWS: usize = 16;
 
 /// One visibility-buffer pixel.
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +92,20 @@ fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
     (bx - ax) * (py - ay) - (by - ay) * (px - ax)
 }
 
+/// [`edge`] evaluated with the endpoints in a canonical order, so the
+/// two triangles sharing an edge (which traverse it in opposite
+/// directions) get bit-exact negated values — floating-point rounding
+/// otherwise lets a pixel centre on the edge test outside both and
+/// open a crack.
+#[inline]
+fn edge_canon(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
+    if (ax, ay) <= (bx, by) {
+        edge(ax, ay, bx, by, px, py)
+    } else {
+        -edge(bx, by, ax, ay, px, py)
+    }
+}
+
 impl ScreenTri {
     /// Affine screen weights at `(px, py)` (sum to 1; may be negative
     /// outside the triangle).
@@ -145,9 +159,9 @@ impl ScreenTri {
             for px in self.min_x..=self.max_x {
                 let fx = px as f32 + 0.5;
                 let e = [
-                    edge(self.x[1], self.y[1], self.x[2], self.y[2], fx, fy),
-                    edge(self.x[2], self.y[2], self.x[0], self.y[0], fx, fy),
-                    edge(self.x[0], self.y[0], self.x[1], self.y[1], fx, fy),
+                    edge_canon(self.x[1], self.y[1], self.x[2], self.y[2], fx, fy),
+                    edge_canon(self.x[2], self.y[2], self.x[0], self.y[0], fx, fy),
+                    edge_canon(self.x[0], self.y[0], self.x[1], self.y[1], fx, fy),
                 ];
                 let inside = (0..3).all(|k| e[k] > 0.0 || (e[k] == 0.0 && self.top_left[k]));
                 if !inside {
@@ -463,7 +477,7 @@ pub(crate) fn worker_count(pixels: usize) -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(32)
+        .min(8)
 }
 
 /// Run `f(band_index, first_row, rows)` over `BAND_ROWS`-row bands of

@@ -113,8 +113,23 @@ pub(crate) fn srgb_u8_lut() -> &'static [f32; 256] {
 }
 
 /// Linear `[0, 1]` → sRGB byte.
+///
+/// Equivalent to `round(linear_to_srgb(c) * 255)`, evaluated as a
+/// binary search over the 255 linear-light decision thresholds
+/// (`srgb_to_linear((k + 0.5) / 255)`) instead of a `powf` per call.
 pub(crate) fn linear_to_srgb_byte(c: f32) -> u8 {
-    (linear_to_srgb(c) * 255.0).round() as u8
+    static T: std::sync::OnceLock<[f32; 255]> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        let mut t = [0.0f32; 255];
+        for (k, v) in t.iter_mut().enumerate() {
+            *v = srgb_to_linear((k as f32 + 0.5) / 255.0);
+        }
+        t
+    });
+    if c.is_nan() {
+        return 0;
+    }
+    t.partition_point(|&th| th <= c) as u8
 }
 
 /// Scene-linear RGBA `f32` image — the pre-tone-map output of
@@ -213,6 +228,18 @@ mod tests {
         for b in 0..=255u8 {
             assert_eq!(linear_to_srgb_byte(lut[b as usize]), b);
         }
+    }
+
+    #[test]
+    fn threshold_encoder_matches_powf_curve() {
+        for i in 0..=20_000 {
+            let c = i as f32 / 20_000.0;
+            let want = (linear_to_srgb(c) * 255.0).round() as i32;
+            let got = linear_to_srgb_byte(c) as i32;
+            assert!((want - got).abs() <= 1, "{c}: {want} vs {got}");
+        }
+        assert_eq!(linear_to_srgb_byte(-1.0), 0);
+        assert_eq!(linear_to_srgb_byte(7.0), 255);
     }
 
     #[test]

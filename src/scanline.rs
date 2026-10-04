@@ -130,19 +130,21 @@ impl Frame {
     /// mapping each sample through `map` first; averages premultiplied
     /// by alpha (straight average when the block is fully
     /// transparent).
-    fn resolve(&self, map: impl Fn(&Sample) -> [f32; 4]) -> Vec<[f32; 4]> {
+    fn resolve(&self, map: impl Fn(&Sample) -> [f32; 4] + Sync) -> Vec<[f32; 4]> {
         let aa = self.aa as usize;
-        let rw = self.out_w as usize * aa;
-        let mut out = Vec::with_capacity(self.out_w as usize * self.out_h as usize);
-        for oy in 0..self.out_h as usize {
-            for ox in 0..self.out_w as usize {
+        let ow = self.out_w as usize;
+        let rw = ow * aa;
+        let n = (aa * aa) as f32;
+        let mut out = vec![[0.0f32; 4]; ow * self.out_h as usize];
+        par_bands(&mut out, ow, |_, y0, rows| {
+            for (i, o) in rows.iter_mut().enumerate() {
+                let (ox, oy) = (i % ow, y0 + i / ow);
                 let mut pre = [0.0f32; 3];
                 let mut straight = [0.0f32; 3];
                 let mut a_sum = 0.0f32;
                 for j in 0..aa {
                     for i in 0..aa {
-                        let s = &self.samples[(oy * aa + j) * rw + ox * aa + i];
-                        let c = map(s);
+                        let c = map(&self.samples[(oy * aa + j) * rw + ox * aa + i]);
                         for k in 0..3 {
                             pre[k] += c[k] * c[3];
                             straight[k] += c[k];
@@ -150,14 +152,13 @@ impl Frame {
                         a_sum += c[3];
                     }
                 }
-                let n = (aa * aa) as f32;
-                out.push(if a_sum > 0.0 {
+                *o = if a_sum > 0.0 {
                     [pre[0] / a_sum, pre[1] / a_sum, pre[2] / a_sum, a_sum / n]
                 } else {
                     [straight[0] / n, straight[1] / n, straight[2] / n, 0.0]
-                });
+                };
             }
-        }
+        });
         out
     }
 
@@ -175,13 +176,19 @@ impl Frame {
             let m = tm.apply([s.c[0] * exposure, s.c[1] * exposure, s.c[2] * exposure]);
             [m[0], m[1], m[2], s.c[3].clamp(0.0, 1.0)]
         });
-        let mut pixels = Vec::with_capacity(px.len() * 4);
-        for c in px {
-            pixels.push(linear_to_srgb_byte(c[0]));
-            pixels.push(linear_to_srgb_byte(c[1]));
-            pixels.push(linear_to_srgb_byte(c[2]));
-            pixels.push((c[3].clamp(0.0, 1.0) * 255.0).round() as u8);
-        }
+        let mut bytes = vec![[0u8; 4]; px.len()];
+        par_bands(&mut bytes, self.out_w as usize, |band, _, rows| {
+            let start = band * crate::raster::BAND_ROWS * self.out_w as usize;
+            for (o, c) in rows.iter_mut().zip(&px[start..]) {
+                *o = [
+                    linear_to_srgb_byte(c[0]),
+                    linear_to_srgb_byte(c[1]),
+                    linear_to_srgb_byte(c[2]),
+                    (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                ];
+            }
+        });
+        let pixels: Vec<u8> = bytes.into_iter().flatten().collect();
         RgbaImage {
             width: self.out_w,
             height: self.out_h,

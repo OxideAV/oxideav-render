@@ -152,6 +152,43 @@ fn textured_quad_samples_texels_in_place() {
 }
 
 #[test]
+fn shared_diagonal_has_no_cracks() {
+    // Regression: with the auto-framed camera the quad's shared
+    // diagonal runs exactly through pixel centres; float rounding of
+    // the two triangles' edge functions used to leave background
+    // pixels on it.
+    for (w, h) in [(160, 120), (97, 61), (128, 128), (333, 250)] {
+        let scene = textured_quad(Sampler::default());
+        let o = RenderOptions {
+            scene_camera: None,
+            background: BackgroundColor([16, 16, 20, 255]),
+            ..opts(w, h)
+        };
+        let img = render(&scene, &o);
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if img.pixel(x, y) != Some([16, 16, 20, 255]) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                assert_ne!(
+                    img.pixel(x, y),
+                    Some([16, 16, 20, 255]),
+                    "crack at {x},{y} ({w}x{h})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn alpha_mask_and_blend_composite_correctly() {
     let scene = alpha_planes();
     let o = opts(320, 240);
