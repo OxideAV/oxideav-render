@@ -75,6 +75,7 @@ identically:
 
 ```rust
 use oxideav_render::{make_renderer, PathTraceOptions, RenderBackend, RenderOptions};
+# let scene = oxideav_mesh3d::Scene3D::new();
 
 let opts = RenderOptions {
     scene_camera: Some(0),
@@ -87,6 +88,7 @@ let opts = RenderOptions {
     ..RenderOptions::default()
 };
 let img = make_renderer(RenderBackend::PathTrace)?.render(&scene, &opts)?;
+# Ok::<(), oxideav_render::Error>(())
 ```
 
 Interactive callers drive the progressive accumulator instead:
