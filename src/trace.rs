@@ -205,6 +205,13 @@ impl TraceScene {
         }
     }
 
+    /// The SAH BVH over the soup (`None` when nothing is traceable).
+    /// Its leaf slots index global triangles: `bvh.triangles[slot]` is
+    /// the global id `g` of [`Self::tri_refs`].
+    pub fn bvh(&self) -> Option<&Bvh> {
+        self.bvh.as_ref()
+    }
+
     /// Number of traceable triangles.
     pub fn triangle_count(&self) -> usize {
         self.tri_refs.len()

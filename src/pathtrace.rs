@@ -269,7 +269,14 @@ pub fn hash_mix(a: u32, b: u32) -> u32 {
     pcg_hash(a ^ pcg_hash(b))
 }
 
-/// Sobol' generator matrices (direction numbers) for dimensions 0–3.
+/// Sobol' generator matrices (direction numbers) for dimensions 0–3,
+/// as used by [`sobol_owen_4d`]: `m[d][k]` is the column XOR-ed in when
+/// bit `k` of the (scrambled) index is set. Exposed so GPU ports can
+/// upload the exact same tables.
+pub fn sobol_direction_numbers() -> &'static [[u32; 32]; 4] {
+    sobol_matrices()
+}
+
 fn sobol_matrices() -> &'static [[u32; 32]; 4] {
     static M: OnceLock<[[u32; 32]; 4]> = OnceLock::new();
     M.get_or_init(|| {
@@ -580,8 +587,19 @@ fn v_neubelt(nl: f32, nv: f32) -> f32 {
     1.0 / (4.0 * (nl + nv - nl * nv)).max(1.0e-6)
 }
 
-const SHEEN_LUT_COS: usize = 32;
-const SHEEN_LUT_ROUGH: usize = 16;
+/// Cosine resolution of [`sheen_albedo_table`].
+pub const SHEEN_LUT_COS: usize = 32;
+/// Roughness resolution of [`sheen_albedo_table`].
+pub const SHEEN_LUT_ROUGH: usize = 16;
+
+/// The tabulated sheen directional albedo `E(cos θ_v, roughness)` the
+/// BSDF uses (§4): row-major `[roughness][cos]`, `SHEEN_LUT_ROUGH ×
+/// SHEEN_LUT_COS` entries, cos bins centred at `(i + ½)/SHEEN_LUT_COS`,
+/// roughness at `j/(SHEEN_LUT_ROUGH − 1)`, read bilinearly. Exposed so
+/// GPU ports evaluate the identical table.
+pub fn sheen_albedo_table() -> &'static [f32] {
+    sheen_lut()
+}
 
 /// Directional albedo `E(cos θ_v, roughness)` of the white sheen lobe,
 /// tabulated by midpoint quadrature on first use.
@@ -980,21 +998,24 @@ impl Bsdf {
 // Lights.
 // =====================================================================
 
-/// Power-proportional table of emissive triangles.
+/// Power-proportional table of emissive triangles (§3 step 6:
+/// `Φ_t = A_t · lum(Le_t) · (2 if double-sided)`). Public so GPU ports
+/// sample the identical distribution.
 #[derive(Debug, Clone, Default)]
-struct EmissiveLights {
+pub struct EmissiveLights {
     /// Global triangle id per light.
-    tris: Vec<u32>,
+    pub tris: Vec<u32>,
     /// Selection probability per light.
-    pmf: Vec<f32>,
-    /// Inclusive CDF.
-    cdf: Vec<f32>,
+    pub pmf: Vec<f32>,
+    /// Inclusive CDF (last entry exactly 1).
+    pub cdf: Vec<f32>,
     /// Global triangle → light index (`u32::MAX` = not a light).
-    lookup: Vec<u32>,
+    pub lookup: Vec<u32>,
 }
 
 impl EmissiveLights {
-    fn build(ts: &TraceScene) -> Self {
+    /// Build the table over every emissive triangle of `ts`.
+    pub fn build(ts: &TraceScene) -> Self {
         let p = &ts.prepared;
         let mut tris = Vec::new();
         let mut power = Vec::new();
@@ -1060,7 +1081,8 @@ impl EmissiveLights {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    /// `true` when the scene has no emissive triangle.
+    pub fn is_empty(&self) -> bool {
         self.tris.is_empty()
     }
 
@@ -1152,6 +1174,37 @@ impl EnvironmentMap {
             mass,
             uniform,
         }
+    }
+
+    /// The equirectangular image (scene-linear RGBA, row 0 = `+Y`).
+    pub fn image(&self) -> &HdrImage {
+        &self.image
+    }
+
+    /// Radiance scale applied to every texel.
+    pub fn intensity(&self) -> f32 {
+        self.intensity
+    }
+
+    /// Marginal CDF over rows (`height + 1` entries, first 0, last 1).
+    pub fn marginal_cdf(&self) -> &[f32] {
+        &self.marginal
+    }
+
+    /// Per-row conditional CDFs, `height` rows of `width + 1` entries.
+    pub fn conditional_cdf(&self) -> &[f32] {
+        &self.conditional
+    }
+
+    /// Normalised probability mass per texel (row-major).
+    pub fn texel_mass(&self) -> &[f32] {
+        &self.mass
+    }
+
+    /// `true` when the image carried no usable radiance: sampling is
+    /// then uniform in `sin θ` and [`Self::radiance`] returns black.
+    pub fn is_uniform(&self) -> bool {
+        self.uniform
     }
 
     fn dims(&self) -> (usize, usize) {
@@ -1863,8 +1916,10 @@ impl Default for PathTracer {
 }
 
 /// Options with every field that cannot change the radiance estimate
-/// normalised away.
-fn radiance_key(o: &RenderOptions) -> RenderOptions {
+/// normalised away — [`PathTracer::sync`] resets the accumulation
+/// exactly when this differs (or the scene is re-prepared). Public so
+/// other progressive tracers apply the same reset rule.
+pub fn radiance_key(o: &RenderOptions) -> RenderOptions {
     let d = RenderOptions::default();
     RenderOptions {
         background: d.background,
