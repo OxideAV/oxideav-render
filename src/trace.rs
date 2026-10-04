@@ -95,6 +95,19 @@ pub enum TexLod {
         /// Unit ray direction.
         dir: [f32; 3],
     },
+    /// Ray differentials (Igehy, "Tracing Ray Differentials",
+    /// SIGGRAPH 1999): the change of the hit barycentrics per output
+    /// pixel along screen `x` / `y`, obtained by intersecting the
+    /// neighbouring pixels' rays with the hit triangle's plane
+    /// ([`barycentric_differentials`]). UV derivatives follow exactly
+    /// as in the rasteriser, so primary-ray filtering matches the
+    /// scanline backend.
+    Grad {
+        /// Barycentric derivative along `x`.
+        dx: [f32; 3],
+        /// Barycentric derivative along `y`.
+        dy: [f32; 3],
+    },
 }
 
 /// The glTF material inputs evaluated at a surface point. Colours are
@@ -411,8 +424,43 @@ impl TraceScene {
         space: ColorSpace,
     ) -> Option<[f32; 4]> {
         let base = 3 * hit.tri as usize;
+        if let TexLod::Grad { dx, dy } = *lod {
+            return self.sample_grad(item, binding, base, hit.barycentric, dx, dy, space);
+        }
         let l = self.lod(item, binding, base, lod);
         self.sample(item, binding, base, hit.barycentric, l, space)
+    }
+
+    /// Sample with barycentric screen derivatives (the rasteriser's
+    /// construction: move the barycentrics by one pixel, difference
+    /// the transformed UVs).
+    #[allow(clippy::too_many_arguments)]
+    fn sample_grad(
+        &self,
+        item: &DrawItem,
+        binding: &TextureBinding,
+        base: usize,
+        b: [f32; 3],
+        dx: [f32; 3],
+        dy: [f32; 3],
+        space: ColorSpace,
+    ) -> Option<[f32; 4]> {
+        let tex = self.prepared.texture(binding)?;
+        let uvs = item.uv_set(binding.uv_set)?;
+        if uvs.len() != item.positions.len() {
+            return None;
+        }
+        let uv = interp2(uvs, base, b);
+        let tuv = binding.transform_uv(uv);
+        let duv = |d: [f32; 3]| -> [f32; 2] {
+            let moved = [
+                uv[0] + uvs[base][0] * d[0] + uvs[base + 1][0] * d[1] + uvs[base + 2][0] * d[2],
+                uv[1] + uvs[base][1] * d[0] + uvs[base + 1][1] * d[1] + uvs[base + 2][1] * d[2],
+            ];
+            let m = binding.transform_uv(moved);
+            [m[0] - tuv[0], m[1] - tuv[1]]
+        };
+        Some(tex.sample_grad(tuv, duv(dx), duv(dy), space))
     }
 
     /// Resolve an extension texture reference against the prepared
@@ -474,6 +522,30 @@ impl TraceScene {
     /// Evaluate every material input at `hit` (`surf` from
     /// [`Self::surface`]).
     pub fn material(&self, hit: &TraceHit, surf: &Surface, lod: TexLod) -> MaterialSample {
+        self.material_oriented(hit, surf, lod, false)
+    }
+
+    /// [`Self::material`] with the shading normal flipped *before*
+    /// the normal map is applied when `flip` is set — the glTF
+    /// double-sided back-face rule as the scanline backend applies it
+    /// (the tangent stays, the normal reverses). The returned normals
+    /// then face the back side.
+    pub fn material_oriented(
+        &self,
+        hit: &TraceHit,
+        surf: &Surface,
+        lod: TexLod,
+        flip: bool,
+    ) -> MaterialSample {
+        let sn = if flip {
+            [
+                -surf.shading_normal[0],
+                -surf.shading_normal[1],
+                -surf.shading_normal[2],
+            ]
+        } else {
+            surf.shading_normal
+        };
         let (item, mat) = self.item(hit);
         let base = 3 * hit.tri as usize;
         let b = hit.barycentric;
@@ -500,7 +572,7 @@ impl TraceScene {
             roughness *= t[1];
             metallic *= t[2];
         }
-        let mut normal = surf.shading_normal;
+        let mut normal = sn;
         if let Some(t) = samp(&mat.normal_texture, ColorSpace::Linear) {
             normal = Self::perturb(item, base, b, normal, t, mat.normal_scale);
         }
@@ -562,8 +634,7 @@ impl TraceScene {
                 f32::INFINITY
             };
         }
-        let (mut clearcoat, mut clearcoat_roughness, mut clearcoat_normal) =
-            (0.0, 0.0, surf.shading_normal);
+        let (mut clearcoat, mut clearcoat_roughness, mut clearcoat_normal) = (0.0, 0.0, sn);
         if let Some(c) = &ext.clearcoat {
             clearcoat = fin(c.factor, 0.0).clamp(0.0, 1.0);
             if let Some(t) = ext_samp(&c.factor_texture, ColorSpace::Linear) {
@@ -574,14 +645,7 @@ impl TraceScene {
                 clearcoat_roughness *= t[1];
             }
             if let Some(t) = ext_samp(&c.normal_texture, ColorSpace::Linear) {
-                clearcoat_normal = Self::perturb(
-                    item,
-                    base,
-                    b,
-                    surf.shading_normal,
-                    t,
-                    fin(c.normal_scale, 1.0),
-                );
+                clearcoat_normal = Self::perturb(item, base, b, sn, t, fin(c.normal_scale, 1.0));
             }
         }
         let (mut sheen_color, mut sheen_roughness) = ([0.0; 3], 0.0);
@@ -625,6 +689,231 @@ impl TraceScene {
             sheen_color,
             sheen_roughness,
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Shadow rays, direct lighting, secondary-ray helpers.
+// ---------------------------------------------------------------------
+
+impl TraceScene {
+    /// Fraction of light (per channel) travelling from `origin` along
+    /// unit `dir` over `[0, t_max]` — the hard-shadow visibility term
+    /// of Whitted 1980, extended to partial occluders:
+    ///
+    /// * opaque surfaces block (`0`);
+    /// * `MASK` cut-outs below the cutoff let light through;
+    /// * `BLEND` surfaces pass `1 − α`;
+    /// * `KHR_materials_transmission` surfaces pass
+    ///   `transmission · (1 − metallic) · baseColor` — at every
+    ///   crossing of a thin wall, on entry only (front faces) for a
+    ///   `KHR_materials_volume` body. The straight shadow ray ignores
+    ///   refraction (no caustics).
+    ///
+    /// Global triangle `skip` (the surface the ray leaves) is ignored.
+    /// Products are order-independent, so the BVH may report candidates
+    /// in any order.
+    pub fn shadow_transmittance(
+        &self,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        t_max: f32,
+        skip: Option<u32>,
+    ) -> [f32; 3] {
+        let mut tr = [1.0f32; 3];
+        let blocked = self.occluded_filtered(origin, dir, 0.0, t_max, |h| {
+            if Some(h.global) == skip {
+                return false;
+            }
+            let (_, mat) = self.item(h);
+            let mut pass = match mat.alpha_mode {
+                AlphaMode::Mask { cutoff } => {
+                    if self.alpha(h) < cutoff {
+                        return false;
+                    }
+                    [0.0; 3]
+                }
+                AlphaMode::Blend => [1.0 - self.alpha(h).clamp(0.0, 1.0); 3],
+                AlphaMode::Opaque => [0.0; 3],
+            };
+            let has_transmission = mat
+                .ext
+                .transmission
+                .is_some_and(|t| t.factor.is_finite() && t.factor > 0.0);
+            if has_transmission {
+                let surf = self.surface(h);
+                let m = self.material(h, &surf, TexLod::Base);
+                if m.transmission > 0.0 {
+                    if m.thickness > 0.0 && !h.front_face {
+                        return false;
+                    }
+                    let kt = m.transmission * (1.0 - m.metallic);
+                    let a = if mat.alpha_mode == AlphaMode::Blend {
+                        pass[0]
+                    } else {
+                        0.0
+                    };
+                    for (pk, ck) in pass.iter_mut().zip(m.base_color) {
+                        *pk = a + (1.0 - a) * kt * ck;
+                    }
+                }
+            }
+            for k in 0..3 {
+                tr[k] *= pass[k].clamp(0.0, 1.0);
+            }
+            tr.iter().all(|&v| v <= 1.0e-4)
+        });
+        if blocked {
+            [0.0; 3]
+        } else {
+            tr
+        }
+    }
+
+    /// Direct radiance reflected toward `v` at `p` (shading normal
+    /// `n`, geometric normal `ng`, both on the viewed side) from every
+    /// prepared light: `Σ f(l, v)(n·l) · E · T`, with the BRDF of
+    /// [`crate::brdf::eval`], `E` from
+    /// [`crate::prepare::PreparedLight::sample`] and `T` the
+    /// [`Self::shadow_transmittance`] toward the light when `shadows`
+    /// is set (`1` otherwise). Works for directional, point and spot
+    /// lights alike.
+    #[allow(clippy::too_many_arguments)]
+    pub fn direct_light(
+        &self,
+        p: [f32; 3],
+        n: [f32; 3],
+        ng: [f32; 3],
+        v: [f32; 3],
+        params: &crate::brdf::BrdfParams,
+        shadows: bool,
+        skip: Option<u32>,
+    ) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for light in &self.prepared.lights {
+            let Some(s) = light.sample(p) else {
+                continue;
+            };
+            let f = crate::brdf::eval(params, n, v, s.l);
+            if f == [0.0; 3] {
+                continue;
+            }
+            let vis = if shadows {
+                let side = if vec3_dot(ng, s.l) >= 0.0 { 1.0 } else { -1.0 };
+                let o = offset_ray_origin(p, [ng[0] * side, ng[1] * side, ng[2] * side]);
+                let t_max = if s.distance.is_finite() {
+                    s.distance * (1.0 - 1.0e-4)
+                } else {
+                    f32::INFINITY
+                };
+                self.shadow_transmittance(o, s.l, t_max, skip)
+            } else {
+                [1.0; 3]
+            };
+            for k in 0..3 {
+                out[k] += f[k] * s.radiance[k] * vis[k];
+            }
+        }
+        out
+    }
+
+    /// Ray-differential footprint of `hit` ([`TexLod::Grad`]): the
+    /// neighbouring pixels' rays `dx` / `dy` (each `(origin, dir)`)
+    /// are intersected with the hit triangle's plane (Igehy 1999) and
+    /// the barycentric differences returned, together with the
+    /// footprint's world width (the larger of the two offsets) for a
+    /// later switch to a ray cone. `None` when a neighbour ray runs
+    /// parallel to the plane.
+    pub fn barycentric_differentials(
+        &self,
+        hit: &TraceHit,
+        dx: ([f32; 3], [f32; 3]),
+        dy: ([f32; 3], [f32; 3]),
+    ) -> Option<(TexLod, f32)> {
+        let [p0, p1, p2] = self.triangle_positions(hit.global);
+        let ng = vec3_cross(vec3_sub(p1, p0), vec3_sub(p2, p0));
+        let b = hit.barycentric;
+        let p = interp3(&[p0, p1, p2], 0, b);
+        let on_plane = |(o, d): ([f32; 3], [f32; 3])| -> Option<([f32; 3], f32)> {
+            let denom = vec3_dot(ng, d);
+            if denom.abs() <= f32::MIN_POSITIVE {
+                return None;
+            }
+            let t = vec3_dot(ng, vec3_sub(p0, o)) / denom;
+            let q = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+            let bq = barycentric_of(q, p0, p1, p2)?;
+            let w = vec3_sub(q, p);
+            let w = vec3_dot(w, w).sqrt();
+            if !w.is_finite() {
+                return None;
+            }
+            Some(([bq[0] - b[0], bq[1] - b[1], bq[2] - b[2]], w))
+        };
+        let (gx, wx) = on_plane(dx)?;
+        let (gy, wy) = on_plane(dy)?;
+        Some((TexLod::Grad { dx: gx, dy: gy }, wx.max(wy)))
+    }
+}
+
+/// Mirror direction `d` (pointing into the surface) about unit normal
+/// `n`: `d − 2 (d·n) n` (law of reflection).
+pub fn reflect(d: [f32; 3], n: [f32; 3]) -> [f32; 3] {
+    let k = 2.0 * vec3_dot(d, n);
+    [d[0] - k * n[0], d[1] - k * n[1], d[2] - k * n[2]]
+}
+
+/// Refract unit direction `d` through unit normal `n` (on the incident
+/// side) with relative index `eta = n_incident / n_transmitted`;
+/// `None` on total internal reflection. Vector form of Snell's law:
+/// with `cos_i = −d·n`, `sin²_t = η²(1 − cos²_i)`,
+/// `t = η d + (η cos_i − cos_t) n`.
+pub fn refract(d: [f32; 3], n: [f32; 3], eta: f32) -> Option<[f32; 3]> {
+    let cos_i = (-vec3_dot(d, n)).clamp(-1.0, 1.0);
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t > 1.0 {
+        return None;
+    }
+    let cos_t = (1.0 - sin2_t).sqrt();
+    let k = eta * cos_i - cos_t;
+    Some(vec3_normalise([
+        eta * d[0] + k * n[0],
+        eta * d[1] + k * n[1],
+        eta * d[2] + k * n[2],
+    ]))
+}
+
+/// Scalar Schlick Fresnel (Schlick, Eurographics 1994):
+/// `F0 + (1 − F0)(1 − cos)⁵`.
+pub fn schlick(f0: f32, cos: f32) -> f32 {
+    f0 + (1.0 - f0) * (1.0 - cos.clamp(0.0, 1.0)).powi(5)
+}
+
+/// Barycentrics `[w, u, v]` of a point `q` on the plane of triangle
+/// `p0 p1 p2` (least-squares projection; `None` when degenerate).
+pub fn barycentric_of(q: [f32; 3], p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> Option<[f32; 3]> {
+    let e1 = vec3_sub(p1, p0);
+    let e2 = vec3_sub(p2, p0);
+    let r = vec3_sub(q, p0);
+    let (d11, d12, d22) = (vec3_dot(e1, e1), vec3_dot(e1, e2), vec3_dot(e2, e2));
+    let (r1, r2) = (vec3_dot(r, e1), vec3_dot(r, e2));
+    let det = d11 * d22 - d12 * d12;
+    if !det.is_finite() || det.abs() <= f32::MIN_POSITIVE {
+        return None;
+    }
+    let u = (d22 * r1 - d12 * r2) / det;
+    let v = (d11 * r2 - d12 * r1) / det;
+    Some([1.0 - u - v, u, v])
+}
+
+/// Spread angle of one pixel of a `height`-pixel render through
+/// `camera` — the ray-cone spread `γ` of Akenine-Möller et al. 2019
+/// (`0` for orthographic cameras, whose rays stay parallel).
+pub fn pixel_spread(camera: &crate::camera::Camera, height: u32) -> f32 {
+    match camera.projection {
+        crate::options::Projection::Perspective => {
+            (2.0 * camera.half_h / height.max(1) as f32).atan()
+        }
+        crate::options::Projection::Orthographic => 0.0,
     }
 }
 
@@ -733,6 +1022,52 @@ mod tests {
         let m = ts.material(&h, &s, TexLod::Base);
         assert!(m.base_color[0] > 0.6 && m.base_color[1] < 0.1, "{m:?}");
         assert_eq!(m.transmission, 0.0);
+    }
+
+    #[test]
+    fn snell_schlick_and_barycentrics() {
+        let r = reflect([1.0, -1.0, 0.0], [0.0, 1.0, 0.0]);
+        assert!((r[1] - 1.0).abs() < 1e-6 && (r[0] - 1.0).abs() < 1e-6);
+        let d = vec3_normalise([0.3, -0.9, 0.1]);
+        let t = refract(d, [0.0, 1.0, 0.0], 1.0).unwrap();
+        assert!((t[0] - d[0]).abs() < 1e-5 && (t[1] - d[1]).abs() < 1e-5);
+        // Grazing exit from glass: total internal reflection.
+        assert!(refract(vec3_normalise([0.9, -0.1, 0.0]), [0.0, 1.0, 0.0], 1.5).is_none());
+        assert!((schlick(0.04, 1.0) - 0.04).abs() < 1e-6);
+        assert!((schlick(0.04, 0.0) - 1.0).abs() < 1e-6);
+        let b = barycentric_of(
+            [0.25, 0.25, 0.0],
+            [0.0; 3],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        assert!((b[1] - 0.25).abs() < 1e-6 && (b[2] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shadow_transmittance_through_blend_and_mask() {
+        let scene = crate::testscenes::alpha_planes();
+        let p = PreparedScene::build(
+            &scene,
+            &PrepareOptions::default(),
+            &mut TextureCache::default(),
+        );
+        let ts = TraceScene::new(p);
+        let down = [0.0, 0.0, -1.0];
+        // Left half: BLEND plane (α 0.5) at z = 0.5 passes half.
+        let t = ts.shadow_transmittance([-0.5, 0.5, 2.0], down, 1.9, None);
+        assert!((t[0] - 0.5).abs() < 1e-4, "{t:?}");
+        // …and the opaque back plane stops everything.
+        assert_eq!(
+            ts.shadow_transmittance([-0.5, 0.5, 2.0], down, 9.0, None),
+            [0.0; 3]
+        );
+        // Right half: one MASK cell is cut out (only the back plane
+        // blocks, beyond t = 2.5), the other blocks at z = 0.
+        let a = ts.shadow_transmittance([0.5, 0.5, 2.0], down, 2.5, None);
+        let b = ts.shadow_transmittance([0.5, -0.5, 2.0], down, 2.5, None);
+        assert!(a != b && (a == [1.0; 3] || b == [1.0; 3]), "{a:?} {b:?}");
     }
 
     #[test]

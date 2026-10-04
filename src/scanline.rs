@@ -98,24 +98,31 @@ pub(crate) fn render_hdr_with_cache(
 
 /// One shaded sample: scene-linear straight-alpha colour, and whether
 /// any geometry covers it.
+///
+/// Shared with the ray-based backends, which fill a [`Frame`] the same
+/// way so every CPU backend has one resolve contract.
 #[derive(Debug, Clone, Copy)]
-struct Sample {
-    c: [f32; 4],
-    covered: bool,
+pub(crate) struct Sample {
+    pub(crate) c: [f32; 4],
+    pub(crate) covered: bool,
 }
 
-struct Frame {
-    out_w: u32,
-    out_h: u32,
-    aa: u32,
-    samples: Vec<Sample>,
-    background: [u8; 4],
+/// A render-resolution sample buffer plus the display transform
+/// (exposure, tone map, SSAA box filter, sRGB encode) shared by every
+/// CPU backend.
+pub(crate) struct Frame {
+    pub(crate) out_w: u32,
+    pub(crate) out_h: u32,
+    pub(crate) aa: u32,
+    /// `out_w·aa × out_h·aa` samples, row-major.
+    pub(crate) samples: Vec<Sample>,
+    pub(crate) background: [u8; 4],
     /// Debug visualisers: display transform is a plain clamp.
-    display_referred: bool,
+    pub(crate) display_referred: bool,
 }
 
 impl Frame {
-    fn bg_linear(&self) -> [f32; 4] {
+    pub(crate) fn bg_linear(&self) -> [f32; 4] {
         let lut = srgb_u8_lut();
         let b = self.background;
         [
@@ -162,7 +169,7 @@ impl Frame {
         out
     }
 
-    fn to_rgba8(&self, opts: &RenderOptions) -> RgbaImage {
+    pub(crate) fn to_rgba8(&self, opts: &RenderOptions) -> RgbaImage {
         let bg = self.bg_linear();
         let (tm, exposure) = if self.display_referred {
             (crate::hdr::ToneMap::Clamp, 1.0)
@@ -197,7 +204,7 @@ impl Frame {
         }
     }
 
-    fn to_hdr(&self) -> HdrImage {
+    pub(crate) fn to_hdr(&self) -> HdrImage {
         let bg = self.bg_linear();
         let px = self.resolve(|s| if s.covered { s.c } else { bg });
         HdrImage {
