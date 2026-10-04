@@ -16,7 +16,7 @@ layer:
 | ----------- | ----------------------------------------------------------- |
 | `Scanline`  | done — clipped, perspective-correct, tile-parallel rasteriser; glTF 2.0 metallic-roughness `Pbr` mode (textures, normal / occlusion / emissive maps, vertex colours, unlit, punctual lights, OPAQUE / MASK / BLEND, back-face culling, shadow maps with PCF) plus the legacy Flat / Gouraud / Phong / Wireframe / NormalDebug / DepthDebug modes |
 | `Raycast`   | done — Whitted recursive ray tracer on the prep + trace layers: the scanline glTF `Pbr` model per hit (pixel-identical to scanline without secondary rays) plus ray-traced hard shadows for every light type, Fresnel-weighted mirror reflection, refraction (`KHR_materials_transmission` / `_volume` / `_ior`), MASK any-hit and BLEND see-through rays; legacy modes unchanged; HDR output; tile-parallel |
-| `PathTrace` | done — unbiased Monte Carlo path tracer: NEE to punctual + emissive-triangle lights with MIS, glTF metallic-roughness BSDF with GGX VNDF sampling plus transmission / volume / ior / specular / clearcoat / sheen, MASK / stochastic BLEND, uniform sky or HDR environment map, Owen-scrambled Sobol' sampling, progressive `PathTracer` |
+| `PathTrace` | done — unbiased Monte Carlo path tracer: NEE to punctual + emissive-triangle lights (Arvo spherical-triangle sampling) with MIS, glTF metallic-roughness BSDF with GGX VNDF sampling plus transmission / volume / ior / specular / clearcoat / sheen, MASK / stochastic BLEND, uniform sky or HDR environment map, Owen-scrambled Sobol' sampling, progressive `PathTracer` |
 
 ### Shared layers (public, backend-agnostic)
 
@@ -220,7 +220,8 @@ Akenine-Möller et al. 2019, Woop et al. 2013, Wald 2007, Wächter &
 Binder 2019, Walter et al. 2007, Heitz
 2014, Schlick 1994, Burley 2012, Reinhard et al. 2002, Narkowicz's
 ACES fit, Porter–Duff 1984, IEC 61966-2-1; for the path tracer Kajiya
-1986, Veach 1997, Heitz 2018 (VNDF), Arvo–Kirk 1990, Sobol' 1967 /
+1986, Veach 1997, Heitz 2018 (VNDF), Arvo 1995, Van Oosterom–Strackee
+1983, Arvo–Kirk 1990, Sobol' 1967 /
 Joe–Kuo 2008, Burley 2020, O'Neill 2014, Jarzynski–Olano 2020,
 Shirley–Chiu 1997, Duff et al. 2017, Turk 1990, Estevez–Kulla 2017,
 Woop et al. 2013, Wächter–Binder 2019, Akenine-Möller et al. 2019, the

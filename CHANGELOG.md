@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`RenderBackend::PathTrace`** (`pathtrace`, registry name
   `"pathtrace"`): unbiased unidirectional Monte Carlo path tracer
   (Kajiya 1986). Next-event estimation to every `KHR_lights_punctual`
-  light and to one power-sampled emissive triangle (uniform area) or
-  environment texel per vertex, power-heuristic MIS against BSDF
+  light and to one power-sampled emissive triangle (spherical-triangle
+  sampling, Arvo 1995, with a uniform-area fallback for tiny solid
+  angles) or environment texel per vertex, power-heuristic MIS against BSDF
   sampling (Veach 1997), Russian roulette, optional firefly clamp.
   BSDF: glTF metallic-roughness with GGX visible-normal sampling
   (Heitz 2018), cosine diffuse and Fresnel-weighted lobe selection

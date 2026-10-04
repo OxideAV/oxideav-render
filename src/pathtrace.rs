@@ -125,11 +125,22 @@
 //!      probability 1. An emissive triangle `t` is picked from the
 //!      discrete CDF of its power `Φ_t = A_t · lum(Le_t) · (2 if
 //!      double-sided else 1)` (`lum` = Rec. 709 luminance; textured
-//!      emission uses the texture's mean, i.e. its 1×1 mip), a point
-//!      uniformly by area: barycentrics
+//!      emission uses the texture's mean, i.e. its 1×1 mip). With
+//!      `Ω` = the triangle's solid angle from the vertex position `p`
+//!      ([`triangle_solid_angle`], Van Oosterom & Strackee 1983):
+//!      if `Ω ≥` [`MIN_SPHERICAL_SOLID_ANGLE`] the direction is drawn
+//!      uniformly over the spherical triangle ([`sample_spherical_triangle`],
+//!      Arvo, "Stratified Sampling of Spherical Triangles", SIGGRAPH
+//!      1995, with light `u₀` → sub-triangle area, `u₁` → arc
+//!      position) and the light point is that ray's hit on the
+//!      triangle's plane, pdf `p_L = P_area · P_t / Ω`; otherwise a
+//!      point is drawn uniformly by area — barycentrics
 //!      `(1 − √u₀, √u₀(1 − u₁), √u₀·u₁)` (Turk, "Generating Random
-//!      Points in Triangles", Graphics Gems 1990). Solid-angle pdf
-//!      `p_L = P_area · P_t · d² / (A_t · |cos θ_L|)`. The environment
+//!      Points in Triangles", Graphics Gems 1990) — with
+//!      `p_L = P_area · P_t · d² / (A_t · |cos θ_L|)`. The same
+//!      `Ω`-threshold decision, evaluated from the previous vertex
+//!      position, gives `p_L` for emitters found by BSDF rays. The
+//!      environment
 //!      map is sampled from its luminance × `sin θ` 2-D CDF (§5).
 //!      Contribution `β·f·|n·l|·Le·w_L / p_L`, with the power heuristic
 //!      `w_L = p_L² / (p_L² + p_B²)` (`p_B` = the BSDF mixture pdf of
@@ -235,9 +246,7 @@ use crate::math::{vec3_cross, vec3_dot, vec3_normalise};
 use crate::options::{LightStrategy, PathTraceOptions, RenderOptions};
 use crate::prepare::{PrepareOptions, PreparedLight, PreparedScene};
 use crate::texture::{ColorSpace, TextureCache, TextureResolver};
-use crate::trace::{
-    interp2, offset_ray_origin, MaterialSample, Surface, TexLod, TraceHit, TraceScene,
-};
+use crate::trace::{interp2, offset_ray_origin, MaterialSample, TexLod, TraceHit, TraceScene};
 
 // =====================================================================
 // Sampling primitives.
@@ -1215,6 +1224,136 @@ impl EnvironmentMap {
 }
 
 // =====================================================================
+// Spherical triangles (Arvo 1995).
+// =====================================================================
+
+/// Solid angles below this use uniform-area sampling instead of
+/// spherical-triangle sampling (too small to sample robustly).
+pub const MIN_SPHERICAL_SOLID_ANGLE: f32 = 1.0e-4;
+
+/// Solid angle of triangle `abc` seen from `p` (Van Oosterom &
+/// Strackee, "The Solid Angle of a Plane Triangle", IEEE Trans.
+/// Biomed. Eng. 30(2), 1983): `tan(Ω/2) = |A·(B×C)| / (1 + A·B + B·C
+/// + C·A)` with `A, B, C` the unit directions to the vertices.
+pub fn triangle_solid_angle(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let u = |q: [f32; 3]| -> [f64; 3] {
+        let d = [
+            (q[0] - p[0]) as f64,
+            (q[1] - p[1]) as f64,
+            (q[2] - p[2]) as f64,
+        ];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if l > 0.0 {
+            [d[0] / l, d[1] / l, d[2] / l]
+        } else {
+            [0.0; 3]
+        }
+    };
+    let (a, b, c) = (u(a), u(b), u(c));
+    let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let bc = [
+        b[1] * c[2] - b[2] * c[1],
+        b[2] * c[0] - b[0] * c[2],
+        b[0] * c[1] - b[1] * c[0],
+    ];
+    let num = dot(a, bc).abs();
+    let den = 1.0 + dot(a, b) + dot(b, c) + dot(c, a);
+    let o = 2.0 * num.atan2(den);
+    if o.is_finite() {
+        o.max(0.0) as f32
+    } else {
+        0.0
+    }
+}
+
+/// Arvo, "Stratified Sampling of Spherical Triangles", SIGGRAPH 1995:
+/// a direction from `p` uniformly distributed (pdf `1/Ω`) over the
+/// spherical projection of triangle `abc`. `None` when degenerate.
+pub fn sample_spherical_triangle(
+    p: [f32; 3],
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    u0: f32,
+    u1: f32,
+) -> Option<[f32; 3]> {
+    type V = [f64; 3];
+    let sub = |x: [f32; 3]| -> V {
+        [
+            (x[0] - p[0]) as f64,
+            (x[1] - p[1]) as f64,
+            (x[2] - p[2]) as f64,
+        ]
+    };
+    let dot = |x: V, y: V| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let cross = |x: V, y: V| -> V {
+        [
+            x[1] * y[2] - x[2] * y[1],
+            x[2] * y[0] - x[0] * y[2],
+            x[0] * y[1] - x[1] * y[0],
+        ]
+    };
+    let norm = |x: V| -> Option<V> {
+        let l = dot(x, x).sqrt();
+        (l > 1.0e-300 && l.is_finite()).then(|| [x[0] / l, x[1] / l, x[2] / l])
+    };
+    let (a, b, c) = (norm(sub(a))?, norm(sub(b))?, norm(sub(c))?);
+    // Interior angles from the great-circle plane normals.
+    let nab = norm(cross(a, b))?;
+    let nbc = norm(cross(b, c))?;
+    let nca = norm(cross(c, a))?;
+    let ang = |x: V, y: V| (-dot(x, y)).clamp(-1.0, 1.0).acos();
+    let alpha = ang(nab, nca);
+    let beta = ang(nbc, nab);
+    let gamma = ang(nca, nbc);
+    let area = alpha + beta + gamma - std::f64::consts::PI;
+    if area.is_nan() || area <= 0.0 {
+        return None;
+    }
+    // Sub-triangle area → new vertex C' on arc AC.
+    let ap = u0 as f64 * area;
+    let (s, t) = (ap - alpha).sin_cos();
+    let (sa, ca) = alpha.sin_cos();
+    let cos_c = dot(a, b);
+    let uu = t - ca;
+    let vv = s + sa * cos_c;
+    let den = (vv * s + uu * t) * sa;
+    if den.abs() < 1.0e-300 {
+        return None;
+    }
+    let q = (((vv * t - uu * s) * ca - vv) / den).clamp(-1.0, 1.0);
+    let ca_perp = norm([
+        c[0] - dot(c, a) * a[0],
+        c[1] - dot(c, a) * a[1],
+        c[2] - dot(c, a) * a[2],
+    ])?;
+    let r = (1.0 - q * q).max(0.0).sqrt();
+    let cp = [
+        q * a[0] + r * ca_perp[0],
+        q * a[1] + r * ca_perp[1],
+        q * a[2] + r * ca_perp[2],
+    ];
+    // Uniform point on arc B–C'.
+    let z = 1.0 - u1 as f64 * (1.0 - dot(cp, b));
+    let cb_perp = norm([
+        cp[0] - dot(cp, b) * b[0],
+        cp[1] - dot(cp, b) * b[1],
+        cp[2] - dot(cp, b) * b[2],
+    ]);
+    let w = (1.0 - z * z).max(0.0).sqrt();
+    let d = match cb_perp {
+        Some(perp) => [
+            z * b[0] + w * perp[0],
+            z * b[1] + w * perp[1],
+            z * b[2] + w * perp[2],
+        ],
+        None => b,
+    };
+    let d = norm(d)?;
+    Some([d[0] as f32, d[1] as f32, d[2] as f32])
+}
+
+// =====================================================================
 // Integrator.
 // =====================================================================
 
@@ -1310,18 +1449,39 @@ impl Integrator<'_> {
         e
     }
 
-    /// Light-sampling solid-angle pdf of reaching emissive `hit` from
-    /// `origin` along `dir` at distance `t`.
-    fn light_pdf(&self, hit: &TraceHit, surf: &Surface, dir: [f32; 3], t: f32) -> f32 {
+    /// Light-sampling solid-angle pdf of choosing emissive triangle
+    /// `g` (light index `li`) and the direction toward `q` on it from
+    /// vertex `p`: spherical (`1/Ω`) when `Ω ≥`
+    /// [`MIN_SPHERICAL_SOLID_ANGLE`], uniform-area otherwise.
+    fn tri_pdf(&self, li: usize, g: u32, p: [f32; 3], q: [f32; 3]) -> f32 {
+        let [a, b, c] = self.ts.triangle_positions(g);
+        let sel = (1.0 - self.p_env()) * self.lights.pmf[li];
+        let omega = triangle_solid_angle(p, a, b, c);
+        if omega >= MIN_SPHERICAL_SOLID_ANGLE {
+            return sel / omega;
+        }
+        let cr = vec3_cross(crate::math::vec3_sub(b, a), crate::math::vec3_sub(c, a));
+        let len = vec3_dot(cr, cr).sqrt();
+        let to = crate::math::vec3_sub(q, p);
+        let d2 = vec3_dot(to, to);
+        if len <= 0.0 || d2 <= 0.0 {
+            return 0.0;
+        }
+        let cos = (vec3_dot(cr, to) / (len * d2.sqrt())).abs();
+        if cos <= 0.0 {
+            return 0.0;
+        }
+        sel * d2 / (0.5 * len * cos)
+    }
+
+    /// Light-sampling pdf of reaching emissive `hit` (at `q`) from the
+    /// previous vertex `p` — 0 when the triangle is not in the table.
+    fn light_pdf(&self, hit: &TraceHit, p: [f32; 3], q: [f32; 3]) -> f32 {
         let li = self.lights.lookup.get(hit.global as usize).copied();
         let Some(li) = li.filter(|&l| l != u32::MAX) else {
             return 0.0;
         };
-        let cos = vec3_dot(surf.geometric_normal, dir).abs();
-        if cos <= 0.0 || surf.area <= 0.0 {
-            return 0.0;
-        }
-        (1.0 - self.p_env()) * self.lights.pmf[li as usize] * t * t / (surf.area * cos)
+        self.tri_pdf(li as usize, hit.global, p, q)
     }
 
     /// Trace sample `index` of pixel `(x, y)`. `None` = uncovered.
@@ -1337,6 +1497,7 @@ impl Integrator<'_> {
         let mut beta = [1.0f32; 3];
         let mut radiance = [0.0f32; 3];
         let mut prev_pdf = 0.0f32;
+        let mut prev_pos = [0.0f32; 3];
         let mut medium: Option<[f32; 3]> = None;
         let strategy = self.pt.strategy;
         let mut k: u32 = 0;
@@ -1385,7 +1546,7 @@ impl Integrator<'_> {
                     if k == 0 {
                         radiance = add(radiance, mul(beta, le));
                     } else {
-                        let pl = self.light_pdf(&hit, &surf, d, hit.t);
+                        let pl = self.light_pdf(&hit, prev_pos, surf.position);
                         let w = if pl <= 0.0 {
                             1.0
                         } else {
@@ -1507,21 +1668,42 @@ impl Integrator<'_> {
                     let li = self.lights.pick(us);
                     let g = self.lights.tris[li];
                     let [a, b, c] = self.ts.triangle_positions(g);
-                    let su = pl_u[0].sqrt();
-                    let bary = [1.0 - su, su * (1.0 - pl_u[1]), su * pl_u[1]];
-                    let q = [
-                        a[0] * bary[0] + b[0] * bary[1] + c[0] * bary[2],
-                        a[1] * bary[0] + b[1] * bary[1] + c[1] * bary[2],
-                        a[2] * bary[0] + b[2] * bary[1] + c[2] * bary[2],
-                    ];
-                    let to = crate::math::vec3_sub(q, p);
-                    let dist2 = vec3_dot(to, to);
-                    if dist2 > 1.0e-12 {
-                        let dist = dist2.sqrt();
-                        let l = scale(to, 1.0 / dist);
+                    // Direction + point on the light: spherical when the
+                    // solid angle allows, uniform area otherwise.
+                    let target = if triangle_solid_angle(p, a, b, c) >= MIN_SPHERICAL_SOLID_ANGLE {
+                        sample_spherical_triangle(p, a, b, c, pl_u[0], pl_u[1]).and_then(|l| {
+                            let n = vec3_cross(
+                                crate::math::vec3_sub(b, a),
+                                crate::math::vec3_sub(c, a),
+                            );
+                            let dn = vec3_dot(l, n);
+                            if dn == 0.0 {
+                                return None;
+                            }
+                            let t = vec3_dot(crate::math::vec3_sub(a, p), n) / dn;
+                            (t > 0.0 && t.is_finite()).then(|| add(p, scale(l, t)))
+                        })
+                    } else {
+                        let su = pl_u[0].sqrt();
+                        let w = [1.0 - su, su * (1.0 - pl_u[1]), su * pl_u[1]];
+                        Some([
+                            a[0] * w[0] + b[0] * w[1] + c[0] * w[2],
+                            a[1] * w[0] + b[1] * w[1] + c[1] * w[2],
+                            a[2] * w[0] + b[2] * w[1] + c[2] * w[2],
+                        ])
+                    };
+                    let bary = target.and_then(|q| crate::trace::barycentric_of(q, a, b, c));
+                    if let (Some(q), Some(bary)) = (target, bary) {
+                        let bary = [
+                            bary[0].clamp(0.0, 1.0),
+                            bary[1].clamp(0.0, 1.0),
+                            bary[2].clamp(0.0, 1.0),
+                        ];
+                        let to = crate::math::vec3_sub(q, p);
+                        let dist2 = vec3_dot(to, to);
                         let r = self.ts.tri_refs()[g as usize];
                         let lh = TraceHit {
-                            t: dist,
+                            t: dist2.sqrt(),
                             global: g,
                             item: r.item,
                             tri: r.tri,
@@ -1529,24 +1711,30 @@ impl Integrator<'_> {
                             front_face: true,
                         };
                         let lsurf = self.ts.surface(&lh);
-                        let cos_l = -vec3_dot(lsurf.geometric_normal, l);
                         let (_, lmat) = self.ts.item(&lh);
-                        if (cos_l > 0.0 || (lmat.double_sided && cos_l < 0.0)) && lsurf.area > 0.0 {
-                            let pl = (1.0 - pe) * self.lights.pmf[li] * dist2
-                                / (lsurf.area * cos_l.abs());
-                            let (f, pb) = bsdf.eval(l);
-                            let le = self.emission(&lh);
-                            if !is_black(f) && !is_black(le) && pl > 0.0 && pl.is_finite() {
-                                let w = if strategy == LightStrategy::Mis {
-                                    power_heuristic(pl, pb)
-                                } else {
-                                    1.0
-                                };
-                                let o2 = spawn(l);
-                                let tmax = (dist * (1.0 - 1.0e-4)).max(0.0);
-                                if self.visible(o2, l, tmax, &s, shadow_id, g) {
-                                    let c = scale(mul(mul(beta, f), le), w / pl);
-                                    radiance = add(radiance, self.clamp(c));
+                        if dist2 > 1.0e-12 {
+                            let dist = dist2.sqrt();
+                            let l = scale(to, 1.0 / dist);
+                            let cos_l = -vec3_dot(lsurf.geometric_normal, l);
+                            let pl = self.tri_pdf(li, g, p, q);
+                            if (cos_l > 0.0 || (lmat.double_sided && cos_l < 0.0))
+                                && pl > 0.0
+                                && pl.is_finite()
+                            {
+                                let (f, pb) = bsdf.eval(l);
+                                let le = self.emission(&lh);
+                                if !is_black(f) && !is_black(le) {
+                                    let w = if strategy == LightStrategy::Mis {
+                                        power_heuristic(pl, pb)
+                                    } else {
+                                        1.0
+                                    };
+                                    let o2 = spawn(l);
+                                    let tmax = (dist * (1.0 - 1.0e-4)).max(0.0);
+                                    if self.visible(o2, l, tmax, &s, shadow_id, g) {
+                                        let c = scale(mul(mul(beta, f), le), w / pl);
+                                        radiance = add(radiance, self.clamp(c));
+                                    }
                                 }
                             }
                         }
@@ -1564,6 +1752,7 @@ impl Integrator<'_> {
                 break;
             }
             prev_pdf = pdf;
+            prev_pos = p;
             // Medium transitions through volume boundaries.
             if vec3_dot(l, ng) < 0.0 && mat.thickness > 0.0 && mat.transmission > 0.0 {
                 if hit.front_face {
@@ -2278,6 +2467,74 @@ mod tests {
         for c in e {
             assert!((c - 1.0).abs() < 1e-3, "{c}");
         }
+    }
+
+    // ---------------- spherical triangles ----------------
+
+    #[test]
+    fn octant_triangle_subtends_half_pi() {
+        let o = triangle_solid_angle([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        assert!((o - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "{o}");
+    }
+
+    #[test]
+    fn spherical_triangle_samples_are_uniform_in_solid_angle() {
+        let p = [0.1, -0.2, 0.0];
+        let (a, b, c) = ([-0.6, 0.3, 1.0], [1.2, -0.4, 0.8], [0.2, 1.1, 1.4]);
+        let omega = triangle_solid_angle(p, a, b, c) as f64;
+        // E[g(ω)] under pdf 1/Ω equals (1/Ω)∫ g dω; integrate the right
+        // side over the triangle's area with dω = cos θ_l dA / r².
+        let g = |d: [f32; 3]| (d[0] as f64 + 0.3).powi(2) + d[1] as f64;
+        let n = vec3_cross(crate::math::vec3_sub(b, a), crate::math::vec3_sub(c, a));
+        let area2 = vec3_dot(n, n).sqrt();
+        let nn = scale(n, 1.0 / area2);
+        let steps = 600;
+        let mut quad = 0.0f64;
+        let mut omega_q = 0.0f64;
+        for i in 0..steps {
+            for j in 0..steps - i {
+                // Midpoint of a sub-triangle cell (upright cells only;
+                // the inverted ones are covered by symmetry at this
+                // resolution).
+                let (u, v) = (
+                    (i as f32 + 1.0 / 3.0) / steps as f32,
+                    (j as f32 + 1.0 / 3.0) / steps as f32,
+                );
+                let q = [
+                    a[0] + (b[0] - a[0]) * u + (c[0] - a[0]) * v,
+                    a[1] + (b[1] - a[1]) * u + (c[1] - a[1]) * v,
+                    a[2] + (b[2] - a[2]) * u + (c[2] - a[2]) * v,
+                ];
+                let to = crate::math::vec3_sub(q, p);
+                let r2 = vec3_dot(to, to);
+                let d = scale(to, 1.0 / r2.sqrt());
+                let dw = (vec3_dot(nn, d).abs() / r2) as f64;
+                quad += g(d) * dw;
+                omega_q += dw;
+            }
+        }
+        let expect = quad / omega_q;
+        assert!(
+            (omega_q * 0.5 * area2 as f64 / (steps * steps) as f64 * 2.0 / omega - 1.0).abs()
+                < 0.02
+        );
+        let m = 1 << 15;
+        let mut sum = 0.0f64;
+        for i in 0..m {
+            let u = sobol_owen_4d(i, 5);
+            let d = sample_spherical_triangle(p, a, b, c, u[0], u[1]).unwrap();
+            // Every direction hits the triangle.
+            let t = vec3_dot(crate::math::vec3_sub(a, p), n) / vec3_dot(d, n);
+            let q = add(p, scale(d, t));
+            let w = crate::trace::barycentric_of(q, a, b, c).unwrap();
+            assert!(w.iter().all(|&x| x > -1e-3), "{w:?}");
+            sum += g(d);
+        }
+        let got = sum / m as f64;
+        assert!(
+            (got - expect).abs() < 0.01 * expect.abs().max(0.1),
+            "{got} vs {expect}"
+        );
     }
 
     // ---------------- environment map ----------------
