@@ -13,6 +13,18 @@
 //! elevation / azimuth, with `distance` as a multiplier of the fit
 //! distance. Look-at / perspective / orthographic matrices use the
 //! standard right-handed column-vector conventions.
+//!
+//! Scene cameras: [`Camera::from_scene_camera`] places a glTF 2.0
+//! camera (§3.10: looks down its node's local `-Z`, `+Y` up) at its
+//! node's world transform, honouring `yfov` / `znear` / `zfar` (an
+//! infinite `zfar` is replaced by a far plane enclosing the scene) or
+//! `xmag` / `ymag`. [`Camera::resolve`] picks between the two exactly
+//! as every backend does, so GPU and CPU backends frame identically.
+//!
+//! Matrices are row-major `m[row][col]` acting on column vectors.
+//! [`Camera::proj`] uses the OpenGL `[-1, 1]` clip-depth convention;
+//! [`Camera::projection_matrix`] emits either convention
+//! ([`DepthRange`]) for Vulkan / wgpu / D3D style `[0, 1]` depth.
 
 use oxideav_mesh3d::{NodeId, Scene3D};
 
@@ -142,37 +154,234 @@ pub(crate) fn walk_scene_preorder(
 // Camera.
 // ---------------------------------------------------------------------
 
-/// Framed camera — projection matrices for the rasteriser plus the
-/// retained placement for per-pixel ray generation.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Camera {
-    /// World → view matrix (rows are the camera basis).
-    pub(crate) view: [[f32; 4]; 4],
-    /// View → clip matrix.
-    pub(crate) proj: [[f32; 4]; 4],
+/// Clip-space depth convention for [`Camera::projection_matrix`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DepthRange {
+    /// OpenGL convention: near → `-1`, far → `+1` (what
+    /// [`Camera::proj`] holds).
+    #[default]
+    NegOneToOne,
+    /// Vulkan / wgpu / D3D convention: near → `0`, far → `1`.
+    ZeroToOne,
+}
+
+/// Resolved view camera — projection matrices for rasterisers plus
+/// the retained placement for per-pixel ray generation. Shared by
+/// every backend so all of them frame the same view of a scene.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camera {
+    /// World → view matrix (rows are the camera basis; the camera
+    /// looks down view-space `-Z`).
+    pub view: [[f32; 4]; 4],
+    /// View → clip matrix, `[-1, 1]` depth ([`DepthRange::NegOneToOne`]).
+    pub proj: [[f32; 4]; 4],
     /// Camera position in world space.
-    pub(crate) eye: [f32; 3],
-    /// Unit forward vector (toward the look-at target).
-    pub(crate) forward: [f32; 3],
+    pub eye: [f32; 3],
+    /// Unit forward vector (viewing direction).
+    pub forward: [f32; 3],
     /// Unit right vector.
-    pub(crate) side: [f32; 3],
+    pub side: [f32; 3],
     /// Unit up vector (orthogonalised).
-    pub(crate) up: [f32; 3],
+    pub up: [f32; 3],
     /// Selected projection kind.
-    pub(crate) projection: Projection,
-    /// Near plane distance (world units along `forward`).
-    pub(crate) near: f32,
+    pub projection: Projection,
+    /// Near plane distance (world units along `forward`; may be
+    /// negative for orthographic auto-framing, which places the near
+    /// plane behind the eye).
+    pub near: f32,
     /// Far plane distance (world units along `forward`).
-    pub(crate) far: f32,
+    pub far: f32,
     /// Half-extent of the view plane at unit distance, horizontal
     /// (`tan(fov/2) * aspect` for perspective) — or half frustum
     /// width in world units for orthographic.
-    pub(crate) half_w: f32,
+    pub half_w: f32,
     /// Vertical counterpart of [`Camera::half_w`].
-    pub(crate) half_h: f32,
+    pub half_h: f32,
 }
 
 impl Camera {
+    /// The camera every backend renders `prepared` through:
+    /// [`RenderOptions::scene_camera`] when it names a valid scene
+    /// camera instance, otherwise auto-framing / orbiting the prepared
+    /// geometry's bounds ([`RenderOptions::camera`]).
+    pub fn resolve(
+        prepared: &crate::prepare::PreparedScene,
+        opts: &RenderOptions,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let (min, max) = prepared.bounds_or_unit();
+        if let Some(inst) = opts.scene_camera.and_then(|i| prepared.cameras.get(i)) {
+            return Self::from_scene_camera(&inst.camera, &inst.world, width, height, min, max);
+        }
+        Self::frame_bounds(width, height, min, max, opts)
+    }
+
+    /// Auto-frame (or orbit, per [`RenderOptions::camera`]) the world
+    /// AABB `min..max` — the historical default camera.
+    pub fn frame_bounds(
+        width: u32,
+        height: u32,
+        min: [f32; 3],
+        max: [f32; 3],
+        opts: &RenderOptions,
+    ) -> Self {
+        Self::build(width, height, BBox { min, max }, opts)
+    }
+
+    /// Place a glTF scene camera at `world` (its node's world matrix;
+    /// scale is ignored). `scene_min` / `scene_max` bound the scene so
+    /// an infinite perspective `zfar` gets a finite far plane.
+    /// The viewport aspect (`width / height`) is always used, glTF
+    /// `aspectRatio` notwithstanding (§3.10.3 lets the client letterbox
+    /// or stretch; this renderer fills the viewport).
+    pub fn from_scene_camera(
+        camera: &oxideav_mesh3d::Camera,
+        world: &[[f32; 4]; 4],
+        width: u32,
+        height: u32,
+        scene_min: [f32; 3],
+        scene_max: [f32; 3],
+    ) -> Self {
+        let eye = [world[0][3], world[1][3], world[2][3]];
+        let mut forward = vec3_normalise([-world[0][2], -world[1][2], -world[2][2]]);
+        if vec3_dot(forward, forward) < 0.5 {
+            forward = [0.0, 0.0, -1.0];
+        }
+        let up_hint = vec3_normalise([world[0][1], world[1][1], world[2][1]]);
+        let mut side = vec3_normalise(vec3_cross(forward, up_hint));
+        if vec3_dot(side, side) < 0.5 {
+            side = vec3_normalise(vec3_cross(forward, [0.0, 1.0, 0.0]));
+            if vec3_dot(side, side) < 0.5 {
+                side = [1.0, 0.0, 0.0];
+            }
+        }
+        let up = vec3_cross(side, forward);
+        let view = [
+            [side[0], side[1], side[2], -vec3_dot(side, eye)],
+            [up[0], up[1], up[2], -vec3_dot(up, eye)],
+            [
+                -forward[0],
+                -forward[1],
+                -forward[2],
+                vec3_dot(forward, eye),
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let aspect = (width.max(1) as f32) / (height.max(1) as f32);
+        // Farthest scene corner along forward — used for an infinite
+        // zfar and as a sanity floor.
+        let mut far_extent: f32 = 0.0;
+        for i in 0..8 {
+            let c = [
+                if i & 1 == 0 {
+                    scene_min[0]
+                } else {
+                    scene_max[0]
+                },
+                if i & 2 == 0 {
+                    scene_min[1]
+                } else {
+                    scene_max[1]
+                },
+                if i & 4 == 0 {
+                    scene_min[2]
+                } else {
+                    scene_max[2]
+                },
+            ];
+            let d = vec3_dot(vec3_sub(c, eye), forward);
+            if d.is_finite() {
+                far_extent = far_extent.max(d);
+            }
+        }
+        match *camera {
+            oxideav_mesh3d::Camera::Perspective {
+                yfov, znear, zfar, ..
+            } => {
+                let yfov =
+                    if yfov.is_finite() && yfov > 1.0e-4 && yfov < std::f32::consts::PI - 1.0e-3 {
+                        yfov
+                    } else {
+                        std::f32::consts::FRAC_PI_3
+                    };
+                let near = if znear.is_finite() && znear > 0.0 {
+                    znear
+                } else {
+                    0.01
+                };
+                let far = match zfar {
+                    Some(f) if f.is_finite() && f > near => f,
+                    _ => (far_extent * 1.05).max(near * 2.0 + 1.0e-3),
+                };
+                let tan_half = (yfov * 0.5).tan();
+                Self {
+                    view,
+                    proj: perspective(yfov, aspect, near, far),
+                    eye,
+                    forward,
+                    side,
+                    up,
+                    projection: Projection::Perspective,
+                    near,
+                    far,
+                    half_w: tan_half * aspect,
+                    half_h: tan_half,
+                }
+            }
+            oxideav_mesh3d::Camera::Orthographic {
+                ymag, znear, zfar, ..
+            } => {
+                let half_h = if ymag.is_finite() && ymag.abs() > 1.0e-6 {
+                    ymag.abs()
+                } else {
+                    1.0
+                };
+                let half_w = half_h * aspect;
+                let near = if znear.is_finite() { znear } else { 0.0 };
+                let far = if zfar.is_finite() && zfar > near {
+                    zfar
+                } else {
+                    (far_extent * 1.05).max(near + 1.0e-3)
+                };
+                Self {
+                    view,
+                    proj: orthographic(-half_w, half_w, -half_h, half_h, near, far),
+                    eye,
+                    forward,
+                    side,
+                    up,
+                    projection: Projection::Orthographic,
+                    near,
+                    far,
+                    half_w,
+                    half_h,
+                }
+            }
+        }
+    }
+
+    /// View → clip matrix in the requested depth convention.
+    pub fn projection_matrix(&self, range: DepthRange) -> [[f32; 4]; 4] {
+        match range {
+            DepthRange::NegOneToOne => self.proj,
+            DepthRange::ZeroToOne => {
+                // z01 = 0.5 * z + 0.5 * w — remap row 2.
+                let mut m = self.proj;
+                let (row2, row3) = (self.proj[2], self.proj[3]);
+                for (dst, (a, b)) in m[2].iter_mut().zip(row2.iter().zip(row3.iter())) {
+                    *dst = 0.5 * a + 0.5 * b;
+                }
+                m
+            }
+        }
+    }
+
+    /// World → clip matrix (`projection_matrix(range) · view`).
+    pub fn view_projection(&self, range: DepthRange) -> [[f32; 4]; 4] {
+        mat4_mul(self.projection_matrix(range), self.view)
+    }
+
     /// Build a camera honouring [`RenderOptions::camera`] /
     /// [`RenderOptions::projection`] / [`RenderOptions::fov_deg`].
     pub(crate) fn build(width: u32, height: u32, bbox: BBox, opts: &RenderOptions) -> Self {
@@ -294,13 +503,7 @@ impl Camera {
     /// vertex path, so both backends agree on which world point covers
     /// which pixel. Orthographic: parallel rays along `forward`,
     /// origins spread across the frustum's near rectangle.
-    pub(crate) fn primary_ray(
-        &self,
-        px: f32,
-        py: f32,
-        width: f32,
-        height: f32,
-    ) -> ([f32; 3], [f32; 3]) {
+    pub fn primary_ray(&self, px: f32, py: f32, width: f32, height: f32) -> ([f32; 3], [f32; 3]) {
         let ndc_x = (px / width.max(1.0)) * 2.0 - 1.0;
         let ndc_y = 1.0 - (py / height.max(1.0)) * 2.0;
         match self.projection {
@@ -332,7 +535,7 @@ impl Camera {
     /// NDC z the projection matrix would have produced — near plane →
     /// `-1`, far plane → `+1`. Keeps the raycast backend's DepthDebug
     /// output on the same scale as the rasteriser's interpolated z.
-    pub(crate) fn ndc_z(&self, view_depth: f32) -> f32 {
+    pub fn ndc_z(&self, view_depth: f32) -> f32 {
         match self.projection {
             Projection::Perspective => {
                 let nf = 1.0 / (self.near - self.far);
@@ -352,7 +555,7 @@ impl Camera {
 
     /// Forward view depth of a world point: distance along
     /// [`Camera::forward`] from the camera plane through the eye.
-    pub(crate) fn view_depth(&self, p: [f32; 3]) -> f32 {
+    pub fn view_depth(&self, p: [f32; 3]) -> f32 {
         vec3_dot(vec3_sub(p, self.eye), self.forward)
     }
 }
@@ -579,6 +782,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn zero_to_one_depth_range_maps_near_far() {
+        for projection in [Projection::Perspective, Projection::Orthographic] {
+            let opts = RenderOptions {
+                projection,
+                ..RenderOptions::default()
+            };
+            let cam = Camera::build(64, 64, unit_bbox(), &opts);
+            let m = cam.view_projection(DepthRange::ZeroToOne);
+            for (d, want) in [(cam.near, 0.0), (cam.far, 1.0)] {
+                let p = vec3_add(cam.eye, vec3_scale(cam.forward, d));
+                let c = mat4_mul_vec4(&m, [p[0], p[1], p[2], 1.0]);
+                assert!((c[2] / c[3] - want).abs() < 1e-3, "{projection:?} {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn scene_camera_looks_down_node_minus_z() {
+        // Node translated to +5 Z, identity rotation: looks toward -Z.
+        let mut world = identity4();
+        world[2][3] = 5.0;
+        let cam = Camera::from_scene_camera(
+            &oxideav_mesh3d::Camera::perspective(1.0, 0.1),
+            &world,
+            64,
+            32,
+            [-1.0; 3],
+            [1.0; 3],
+        );
+        assert_eq!(cam.eye, [0.0, 0.0, 5.0]);
+        assert!((cam.forward[2] + 1.0).abs() < 1e-6);
+        assert!((cam.half_w / cam.half_h - 2.0).abs() < 1e-5);
+        assert!(cam.far >= 6.0 - 1e-3, "infinite zfar encloses the scene");
+        let (_, d) = cam.primary_ray(32.0, 16.0, 64.0, 32.0);
+        assert!((d[2] + 1.0).abs() < 1e-5);
+        let ortho = Camera::from_scene_camera(
+            &oxideav_mesh3d::Camera::orthographic(2.0, 3.0, 0.1, 10.0),
+            &world,
+            32,
+            32,
+            [-1.0; 3],
+            [1.0; 3],
+        );
+        assert_eq!(ortho.projection, Projection::Orthographic);
+        assert_eq!(ortho.half_h, 3.0);
     }
 
     #[test]

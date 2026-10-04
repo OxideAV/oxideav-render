@@ -2,6 +2,7 @@
 //! [`crate::Renderer`] consumes.
 
 use crate::error::{Error, Result};
+pub use crate::hdr::ToneMap;
 
 /// Backend selector used by [`crate::make_renderer`].
 ///
@@ -50,6 +51,18 @@ pub enum ShadingMode {
     NormalDebug,
     /// Visualise NDC depth as grayscale (white = near, black = far).
     DepthDebug,
+    /// Physically-based glTF 2.0 metallic-roughness shading (Appendix
+    /// B: GGX / Trowbridge-Reitz NDF, height-correlated Smith
+    /// visibility, Schlick Fresnel, Lambert diffuse) with textures,
+    /// normal / occlusion / emissive maps, vertex colours,
+    /// `KHR_materials_unlit` / `_emissive_strength` / `_ior`, the
+    /// scene's `KHR_lights_punctual` lights (falling back to
+    /// [`RenderOptions::light`]), alpha modes, back-face culling, and
+    /// optional shadow maps ([`RenderOptions::shadows`]).
+    ///
+    /// Backends without a native PBR path (today: `Raycast`) render
+    /// this mode like [`ShadingMode::Phong`].
+    Pbr,
 }
 
 /// Camera projection type.
@@ -160,6 +173,46 @@ pub struct RenderOptions {
     /// output. Hard cap of `8` because at 8× a 1024² render is a
     /// 16 M-pixel framebuffer + an 8 M f32 z-buffer (~80 MB).
     pub aa: u32,
+    /// Tone-mapping operator applied to scene-linear radiance before
+    /// sRGB encoding. Default [`ToneMap::Clamp`] (historical
+    /// behaviour).
+    pub tone_map: ToneMap,
+    /// Linear exposure multiplier applied before tone mapping. Must be
+    /// finite and `>= 0`. Default `1.0`.
+    pub exposure: f32,
+    /// Scene time in seconds at which animations are sampled. `None`
+    /// (default) renders the rest pose (static node transforms, static
+    /// morph weights). Skinning is applied either way.
+    pub time: Option<f32>,
+    /// Index into `Scene3D::animations` sampled at [`Self::time`].
+    /// `None` ⇒ the first animation. Ignored when `time` is `None`.
+    pub animation: Option<usize>,
+    /// Render through a scene camera: an index into the scene's camera
+    /// *instances* (nodes carrying a camera, in scene-graph pre-order —
+    /// see [`crate::prepare::PreparedScene::cameras`]). `None`
+    /// (default), or an out-of-range index, keeps the auto-frame /
+    /// [`Self::camera`] orbit behaviour.
+    pub scene_camera: Option<usize>,
+    /// Use the scene's `KHR_lights_punctual` lights when it has any
+    /// (default `true`). When `false`, or when the scene has no
+    /// lights, [`Self::light`] is the single directional light.
+    pub use_scene_lights: bool,
+    /// Uniform ambient (environment) radiance used by
+    /// [`ShadingMode::Pbr`], scaled by material occlusion. Must be
+    /// finite and `>= 0`. Default `0.2`. The legacy Gouraud / Phong
+    /// modes keep their fixed 0.2 ambient term.
+    pub ambient: f32,
+    /// Shadow maps for directional and spot lights in
+    /// [`ShadingMode::Pbr`] (Williams 1978, filtered with PCF).
+    /// Default `false`.
+    pub shadows: bool,
+    /// Shadow-map resolution (texels per side), `16..=8192`. Default
+    /// `1024`.
+    pub shadow_map_size: u32,
+    /// Active `KHR_materials_variants` variant (index into
+    /// `Scene3D::material_variants`). `None` (default) uses each
+    /// primitive's base material.
+    pub material_variant: Option<usize>,
 }
 
 impl Default for RenderOptions {
@@ -174,6 +227,16 @@ impl Default for RenderOptions {
             light: LightSpec::default_light(),
             camera: None,
             aa: 1,
+            tone_map: ToneMap::Clamp,
+            exposure: 1.0,
+            time: None,
+            animation: None,
+            scene_camera: None,
+            use_scene_lights: true,
+            ambient: 0.2,
+            shadows: false,
+            shadow_map_size: 1024,
+            material_variant: None,
         }
     }
 }
@@ -199,6 +262,8 @@ impl RenderOptions {
     /// * `light.azimuth_deg` and `light.elevation_deg` are finite.
     /// * If `camera` is `Some`, every field is finite and `distance`
     ///   is `> 0`.
+    /// * `exposure` and `ambient` are finite and `>= 0.0`; `time` (if
+    ///   set) is finite; `shadow_map_size` is within `16..=8192`.
     ///
     /// `validate` is **not** called automatically by [`crate::Renderer::render`]
     /// — backends today silently clamp instead — so a caller that wants
@@ -248,6 +313,31 @@ impl RenderOptions {
                 self.light.azimuth_deg, self.light.elevation_deg
             )));
         }
+        if !self.exposure.is_finite() || self.exposure < 0.0 {
+            return Err(Error::InvalidOptions(format!(
+                "exposure must be finite and >= 0.0, got {}",
+                self.exposure
+            )));
+        }
+        if !self.ambient.is_finite() || self.ambient < 0.0 {
+            return Err(Error::InvalidOptions(format!(
+                "ambient must be finite and >= 0.0, got {}",
+                self.ambient
+            )));
+        }
+        if let Some(t) = self.time {
+            if !t.is_finite() {
+                return Err(Error::InvalidOptions(format!(
+                    "time must be finite, got {t}"
+                )));
+            }
+        }
+        if !(16..=8192).contains(&self.shadow_map_size) {
+            return Err(Error::InvalidOptions(format!(
+                "shadow_map_size must be in 16..=8192, got {}",
+                self.shadow_map_size
+            )));
+        }
         if let Some(cam) = self.camera {
             if !cam.azimuth_deg.is_finite() || !cam.elevation_deg.is_finite() {
                 return Err(Error::InvalidOptions(format!(
@@ -293,6 +383,30 @@ mod tests {
         assert_ne!(RenderBackend::Scanline, RenderBackend::Raycast);
         for backend in [RenderBackend::Scanline, RenderBackend::Raycast] {
             assert!(crate::make_renderer(backend).is_ok(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_hdr_and_animation_fields() {
+        for opts in [
+            RenderOptions {
+                exposure: -1.0,
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                ambient: f32::NAN,
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                time: Some(f32::INFINITY),
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                shadow_map_size: 4,
+                ..RenderOptions::default()
+            },
+        ] {
+            assert!(matches!(opts.validate(), Err(Error::InvalidOptions(_))));
         }
     }
 

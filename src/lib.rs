@@ -59,12 +59,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-mod camera;
+pub mod camera;
 pub mod error;
 pub mod hdr;
 pub mod image;
 mod math;
 pub mod options;
+pub mod prepare;
 mod raycast;
 pub mod registry;
 mod scanline;
@@ -74,16 +75,21 @@ pub mod texture;
 #[cfg(feature = "registry")]
 pub mod source;
 
+pub use camera::{Camera, DepthRange};
 pub use error::{Error, Result};
 pub use hdr::{HdrImage, ToneMap};
 pub use image::RgbaImage;
-#[cfg(feature = "registry")]
-pub use texture::RegistryTextureResolver;
-pub use texture::{NoTextureResolver, TextureCache, TextureResolver};
 pub use options::{
     BackgroundColor, CameraSpec, LightSpec, Projection, RenderBackend, RenderOptions, ShadingMode,
 };
+pub use prepare::{
+    DrawItem, DrawTopology, LightKind, PrepareOptions, PreparedLight, PreparedMaterial,
+    PreparedScene, TextureBinding,
+};
 pub use registry::{register_into, RenderRegistry, RendererFactory};
+#[cfg(feature = "registry")]
+pub use texture::RegistryTextureResolver;
+pub use texture::{NoTextureResolver, TextureCache, TextureResolver};
 
 #[cfg(feature = "registry")]
 pub use source::RenderSource;
@@ -108,6 +114,23 @@ pub trait Renderer: Send {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage>;
+
+    /// Render `scene` to a scene-linear floating-point image (before
+    /// exposure / tone mapping / sRGB encoding) — the input for
+    /// EXR-style HDR output. `HdrImage::to_rgba8(opts.tone_map,
+    /// opts.exposure)` reproduces [`Renderer::render`] (up to SSAA
+    /// filtering order and the background, which `render` keeps
+    /// byte-exact).
+    ///
+    /// The default implementation decodes [`Renderer::render`]'s 8-bit
+    /// output back to linear, for backends without a float path.
+    fn render_hdr(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<HdrImage> {
+        Ok(HdrImage::from_rgba8(&self.render(scene, opts)?))
+    }
 }
 
 /// Construct a renderer for `backend`.

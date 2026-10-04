@@ -487,7 +487,7 @@ fn trace_pixel(
             ];
             linear_rgba_to_srgb_u8(mixed)
         }
-        ShadingMode::Phong => {
+        ShadingMode::Phong | ShadingMode::Pbr => {
             let colour = trace_whitted(traced, light, ray, &hit, 0);
             linear_rgba_to_srgb_u8(colour)
         }

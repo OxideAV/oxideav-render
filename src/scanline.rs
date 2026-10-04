@@ -135,16 +135,18 @@ fn draw_primitive(
     // inverse-transpose needed). DepthDebug doesn't need normals, and
     // Flat / Wireframe never look at them.
     let world_normals: Option<Vec<[f32; 3]>> = match mode {
-        ShadingMode::Gouraud | ShadingMode::Phong | ShadingMode::NormalDebug => Some(
-            prim.normals
-                .as_ref()
-                .map(|ns| {
-                    ns.iter()
-                        .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
+        ShadingMode::Gouraud | ShadingMode::Phong | ShadingMode::Pbr | ShadingMode::NormalDebug => {
+            Some(
+                prim.normals
+                    .as_ref()
+                    .map(|ns| {
+                        ns.iter()
+                            .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
         _ => None,
     };
 
@@ -311,7 +313,7 @@ fn draw_tri(
             let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
             rasterise_triangle_flat(fb, va, vb, vc, colour_srgb);
         }
-        ShadingMode::Gouraud | ShadingMode::Phong => {
+        ShadingMode::Gouraud | ShadingMode::Phong | ShadingMode::Pbr => {
             // Pick the three vertex normals for this triangle. Either
             // pulled from the (transformed) per-vertex normal buffer, or
             // synthesised from the face normal of the world-space
