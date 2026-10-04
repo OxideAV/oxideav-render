@@ -26,15 +26,16 @@
 //! triangle, no shared vertices. A parallel per-triangle array
 //! carries the world-space vertex normals (per-vertex when the source
 //! primitive has them, face normal otherwise) and a material slot.
-//! [`oxideav_mesh3d::Bvh`] is built over the baked soup; traversal
-//! walks the BVH's public node array directly against the baked
-//! positions so the per-ray path allocates nothing.
+//! [`oxideav_mesh3d::Bvh`] (binned SAH) is built over the baked soup;
+//! queries go through its allocation-free ordered traversal
+//! (`Bvh::closest_hit` / `Bvh::occluded`) against the baked
+//! positions.
 //!
 //! Line / point topologies have zero surface area and are invisible
 //! to rays; the raycast backend skips them (the scanline backend
 //! remains the renderer for wire/point content).
 
-use oxideav_mesh3d::ray::{intersect_aabb, intersect_triangle, Ray};
+use oxideav_mesh3d::ray::{PreparedRay, Ray, RayQuery};
 use oxideav_mesh3d::{Bvh, Primitive, Scene3D, Topology};
 
 use crate::camera::{scene_bbox, Camera};
@@ -199,98 +200,28 @@ impl TraceScene {
         }
     }
 
-    /// Closest hit against the baked soup in `(0, t_max]`.
+    /// Closest hit against the baked soup in `[0, t_max]`.
     ///
-    /// Allocation-free BVH walk over [`Bvh::nodes`] using the slab
-    /// test for interior nodes and Möller–Trumbore at the leaves;
-    /// the baked soup's implicit indices make triangle `i`'s corners
-    /// `positions[3i .. 3i + 3]` — no index-buffer chase.
+    /// Delegates to the SAH [`Bvh`]'s allocation-free ordered
+    /// traversal ([`Bvh::closest_hit`]); the baked soup's implicit
+    /// indices make the reported triangle index the `shade` slot.
     fn closest_hit(&self, ray: Ray, t_max: f32) -> Option<Hit> {
         let bvh = self.bvh.as_ref()?;
-        intersect_aabb(ray, bvh.nodes[0].bounds.min, bvh.nodes[0].bounds.max, t_max)?;
-
-        let mut best: Option<Hit> = None;
-        let mut best_t = t_max;
-        // Fixed-capacity traversal stack of node indices; BVH depth is
-        // bounded by the leaf threshold + median split, 64 is ample.
-        let mut stack: [u32; 64] = [0; 64];
-        let mut sp = 1usize; // node 0 pre-pushed
-
-        while sp > 0 {
-            sp -= 1;
-            let node = &bvh.nodes[stack[sp] as usize];
-            if intersect_aabb(ray, node.bounds.min, node.bounds.max, best_t).is_none() {
-                continue;
-            }
-            if node.is_leaf() {
-                let first = node.left_or_first as usize;
-                for &tri in &bvh.triangles[first..first + node.tri_count as usize] {
-                    let base = (tri as usize) * 3;
-                    let p0 = self.soup.positions[base];
-                    let p1 = self.soup.positions[base + 1];
-                    let p2 = self.soup.positions[base + 2];
-                    if let Some((t, u, v, _front)) = intersect_triangle(ray, p0, p1, p2, best_t) {
-                        best_t = t;
-                        best = Some(Hit {
-                            t,
-                            triangle: tri as usize,
-                            barycentric: [1.0 - u - v, u, v],
-                        });
-                    }
-                }
-            } else {
-                // Push both children; the per-node slab test above
-                // culls the miss side.
-                if sp + 2 <= stack.len() {
-                    stack[sp] = node.left_or_first;
-                    stack[sp + 1] = node.right_child;
-                    sp += 2;
-                }
-            }
-        }
-        best
+        let h = bvh.closest_hit(&self.soup, &PreparedRay::new(ray), &RayQuery::new(t_max))?;
+        Some(Hit {
+            t: h.t,
+            triangle: h.triangle_index,
+            barycentric: h.barycentric,
+        })
     }
 
-    /// Any-hit (shadow) query in `(0, t_max]` — first intersection
-    /// wins, no ordering.
+    /// Any-hit (shadow) query in `[0, t_max]` — first intersection
+    /// wins, no ordering ([`Bvh::occluded`]).
     fn any_hit(&self, ray: Ray, t_max: f32) -> bool {
         let Some(bvh) = self.bvh.as_ref() else {
             return false;
         };
-        if intersect_aabb(ray, bvh.nodes[0].bounds.min, bvh.nodes[0].bounds.max, t_max).is_none() {
-            return false;
-        }
-        let mut stack: [u32; 64] = [0; 64];
-        let mut sp = 1usize;
-        while sp > 0 {
-            sp -= 1;
-            let node = &bvh.nodes[stack[sp] as usize];
-            if intersect_aabb(ray, node.bounds.min, node.bounds.max, t_max).is_none() {
-                continue;
-            }
-            if node.is_leaf() {
-                let first = node.left_or_first as usize;
-                for &tri in &bvh.triangles[first..first + node.tri_count as usize] {
-                    let base = (tri as usize) * 3;
-                    if intersect_triangle(
-                        ray,
-                        self.soup.positions[base],
-                        self.soup.positions[base + 1],
-                        self.soup.positions[base + 2],
-                        t_max,
-                    )
-                    .is_some()
-                    {
-                        return true;
-                    }
-                }
-            } else if sp + 2 <= stack.len() {
-                stack[sp] = node.left_or_first;
-                stack[sp + 1] = node.right_child;
-                sp += 2;
-            }
-        }
-        false
+        bvh.occluded(&self.soup, &PreparedRay::new(ray), &RayQuery::new(t_max))
     }
 
     /// Interpolated world-space unit normal at a hit.
