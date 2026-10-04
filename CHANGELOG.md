@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Public scene-preparation layer** (`prepare`): `PreparedScene` —
+  world-space de-indexed `DrawItem`s (triangles / lines / points) with
+  animation sampled at a time, morph weights, CPU skinning, generated
+  flat normals / tangents, CCW-front winding; resolved material and
+  texture tables; world-space `KHR_lights_punctual` lights
+  (`PreparedLight::sample` = spec attenuation) with the options light as
+  fallback; scene camera instances. Shared by every backend and the GPU
+  backend.
+- **Public camera** (`camera::Camera`): `resolve` (scene camera or
+  auto-frame / orbit), `from_scene_camera`, `projection_matrix` /
+  `view_projection` with `DepthRange::{NegOneToOne, ZeroToOne}`.
+- **Textures** (`texture`): `TextureResolver` trait, `TextureCache`,
+  `RegistryTextureResolver` (registry feature; decodes via an
+  `oxideav_core::RuntimeContext` + `oxideav-pixfmt`), built-in raw RGBA8
+  container, sRGB / linear mip chains, glTF-sampler CPU sampling
+  (wrap modes, nearest / bilinear / trilinear, derivative LOD).
+- **HDR** (`hdr`): `HdrImage`, `Renderer::render_hdr`, `ToneMap::{Clamp,
+  Reinhard, AcesFitted}`, `exposure`.
+- **`ShadingMode::Pbr`** in the scanline backend: glTF 2.0 Appendix B
+  metallic-roughness BRDF (public `brdf` module), base colour /
+  metallic-roughness / normal / occlusion / emissive textures, vertex
+  colours, `KHR_materials_unlit` / `_emissive_strength` / `_ior`,
+  multiple punctual lights + ambient, OPAQUE / MASK / BLEND (sorted,
+  over-composited), double-sided vs back-face culling, optional shadow
+  maps for directional / spot lights with PCF.
+- `RenderOptions`: `tone_map`, `exposure`, `time`, `animation`,
+  `scene_camera`, `use_scene_lights`, `ambient`, `shadows`,
+  `shadow_map_size`, `material_variant`.
+- `testscenes`: procedural reference scenes + image metrics for
+  cross-backend tests; `tests/scanline_pbr.rs` property suite with raw
+  goldens; `examples/dump_testscenes`.
+
+### Changed
+
+- Scanline backend rebuilt on the prep layer: homogeneous frustum
+  clipping (triangles crossing the near plane are clipped instead of
+  dropped), perspective-correct interpolation, top-left fill rule
+  (crack-free shared edges), visibility buffer with one shade per
+  pixel in linear `f32`, premultiplied SSAA resolve, band-parallel
+  `std::thread::scope` workers with deterministic output.
+  `ScanlineRenderer` now owns a `TextureCache`
+  (`with_texture_resolver`). Legacy shading modes keep their output.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-render/compare/v0.0.3...v0.0.4) - 2026-08-16
 
 ### Added

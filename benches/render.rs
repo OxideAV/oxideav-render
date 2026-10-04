@@ -147,6 +147,40 @@ fn benches(c: &mut Criterion) {
     let flat256 = opts(256, ShadingMode::Flat, 1);
     let phong128aa4 = opts(128, ShadingMode::Phong, 4);
     let phong1 = opts(1, ShadingMode::Phong, 1);
+    let pbr256 = opts(256, ShadingMode::Pbr, 1);
+    let pbr_shadow256 = RenderOptions {
+        shadows: true,
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+    let cornell = oxideav_render::testscenes::cornell_box();
+    let cornell_opts = RenderOptions {
+        scene_camera: Some(0),
+        shadows: true,
+        aa: 2,
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+
+    bench_backend(
+        c,
+        "scanline_pbr_960tri_256",
+        RenderBackend::Scanline,
+        &sphere,
+        &pbr256,
+    );
+    bench_backend(
+        c,
+        "scanline_pbr_shadows_960tri_256",
+        RenderBackend::Scanline,
+        &sphere,
+        &pbr_shadow256,
+    );
+    bench_backend(
+        c,
+        "scanline_pbr_cornell_shadows_aa2_256",
+        RenderBackend::Scanline,
+        &cornell,
+        &cornell_opts,
+    );
 
     bench_backend(
         c,
