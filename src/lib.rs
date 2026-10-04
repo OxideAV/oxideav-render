@@ -84,6 +84,7 @@ mod scanline;
 mod shade;
 pub mod testscenes;
 pub mod texture;
+pub mod trace;
 
 #[cfg(feature = "registry")]
 pub mod source;
