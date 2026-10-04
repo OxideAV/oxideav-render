@@ -9,14 +9,14 @@ Consumes an [`oxideav_mesh3d::Scene3D`] and produces a packed RGBA8
 
 ## Status
 
-Two live CPU backends behind one trait, on a shared scene-preparation
+Three live CPU backends behind one trait, on a shared scene-preparation
 layer:
 
 | Backend     | Status                                                       |
 | ----------- | ----------------------------------------------------------- |
 | `Scanline`  | done — clipped, perspective-correct, tile-parallel rasteriser; glTF 2.0 metallic-roughness `Pbr` mode (textures, normal / occlusion / emissive maps, vertex colours, unlit, punctual lights, OPAQUE / MASK / BLEND, back-face culling, shadow maps with PCF) plus the legacy Flat / Gouraud / Phong / Wireframe / NormalDebug / DepthDebug modes |
 | `Raycast`   | done — Whitted recursive ray tracer on the prep + trace layers: the scanline glTF `Pbr` model per hit (pixel-identical to scanline without secondary rays) plus ray-traced hard shadows for every light type, Fresnel-weighted mirror reflection, refraction (`KHR_materials_transmission` / `_volume` / `_ior`), MASK any-hit and BLEND see-through rays; legacy modes unchanged; HDR output; tile-parallel |
-| `PathTrace` | not yet — path tracing + physically-based BRDF              |
+| `PathTrace` | done — unbiased Monte Carlo path tracer: NEE to punctual + emissive-triangle lights with MIS, glTF metallic-roughness BSDF with GGX VNDF sampling plus transmission / volume / ior / specular / clearcoat / sheen, MASK / stochastic BLEND, uniform sky or HDR environment map, Owen-scrambled Sobol' sampling, progressive `PathTracer` |
 
 ### Shared layers (public, backend-agnostic)
 
@@ -67,6 +67,43 @@ identically:
   alpha MASK / BLEND planes, shadow box, skinned + morph-animated
   beam, normal-mapped quad) and image metrics (MAE, PSNR, region
   mean / stddev) for cross-backend tests.
+
+### Path tracer
+
+`RenderBackend::PathTrace` (registry name `"pathtrace"`) renders
+`RenderOptions::path_trace` samples per pixel:
+
+```rust
+use oxideav_render::{make_renderer, PathTraceOptions, RenderBackend, RenderOptions};
+
+let opts = RenderOptions {
+    scene_camera: Some(0),
+    path_trace: PathTraceOptions {
+        samples_per_pixel: 256, // default 64
+        max_bounces: 8,         // 1 = direct lighting only
+        clamp: 0.0,             // > 0 = biased firefly clamp
+        ..PathTraceOptions::default()
+    },
+    ..RenderOptions::default()
+};
+let img = make_renderer(RenderBackend::PathTrace)?.render(&scene, &opts)?;
+```
+
+Interactive callers drive the progressive accumulator instead:
+`PathTracer::sync(&scene, &opts)` (re-prepares / resets only when the
+scene was invalidated or a radiance-relevant option changed — exposure,
+tone map, background and the sample target never reset),
+`refine(n)` (adds `n` samples per pixel; `refine(a); refine(b)` is
+bit-identical to `refine(a + b)`), `image()` / `hdr()`,
+`invalidate_scene()`, and `set_environment(Some(Arc<EnvironmentMap>))`
+for an importance-sampled equirectangular `HdrImage` sky (otherwise
+`RenderOptions::ambient` is a constant sky radiance). Renders are
+deterministic per `PathTraceOptions::seed`. Uncovered pixels keep the
+background bytes exactly; `aa` and `shading` are ignored.
+
+The `pathtrace` module docs are the normative estimator specification
+(sequence dimensions, lobe-selection probabilities, light-selection
+pdf, MIS weights, roulette rule) for ports such as the GPU backend.
 
 ## Usage
 
@@ -162,14 +199,16 @@ The 3D input type stays `oxideav_mesh3d::Scene3D`.
 
 ## Benchmarks
 
-`benches/render.rs` (criterion) tracks both backends on procedural
-scenes (including the PBR / shadow-map paths); baseline numbers +
-analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). The CPU backends
-are parallel over std scoped threads (bands / tiles) with
-deterministic output.
+`benches/render.rs` (criterion) tracks the backends on procedural
+scenes (including the PBR / shadow-map paths and the path tracer);
+baseline numbers + analysis live in [`BENCHMARKS.md`](BENCHMARKS.md).
+The CPU backends are parallel over std scoped threads (bands / tiles)
+with deterministic output. The path tracer renders the 256² Cornell
+box at 64 spp in ~0.28 s on a 64-thread machine.
 
 `cargo run -p oxideav-render --release --example dump_testscenes --
-out/` renders every reference scene to PNG.
+out/ [scanline|raycast|pathtrace] [spp]` renders every reference scene
+to PNG.
 
 ## Clean-room policy
 
@@ -180,8 +219,13 @@ Williams 1978 / 1983, Reeves et al. 1987, Whitted 1980, Igehy 1999,
 Akenine-Möller et al. 2019, Woop et al. 2013, Wald 2007, Wächter &
 Binder 2019, Walter et al. 2007, Heitz
 2014, Schlick 1994, Burley 2012, Reinhard et al. 2002, Narkowicz's
-ACES fit, Porter–Duff 1984, IEC 61966-2-1. Reference renderer source
-code is not consulted. glTF KHR extensions provide the
+ACES fit, Porter–Duff 1984, IEC 61966-2-1; for the path tracer Kajiya
+1986, Veach 1997, Heitz 2018 (VNDF), Arvo–Kirk 1990, Sobol' 1967 /
+Joe–Kuo 2008, Burley 2020, O'Neill 2014, Jarzynski–Olano 2020,
+Shirley–Chiu 1997, Duff et al. 2017, Turk 1990, Estevez–Kulla 2017,
+Woop et al. 2013, Wächter–Binder 2019, Akenine-Möller et al. 2019, the
+KHR material extension specs and the *Physically Based Rendering*
+book text. Reference renderer source code is not consulted. glTF KHR extensions provide the
 material vocabulary.
 
 ## License

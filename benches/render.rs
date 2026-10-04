@@ -25,7 +25,10 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use oxideav_mesh3d::{
     Indices, Material, MaterialId, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology,
 };
-use oxideav_render::{make_renderer, BackgroundColor, RenderBackend, RenderOptions, ShadingMode};
+use oxideav_render::{
+    make_renderer, BackgroundColor, PathTraceOptions, PathTracer, RenderBackend, RenderOptions,
+    ShadingMode,
+};
 
 /// UV sphere: `segments × rings` quads, two triangles each, indexed,
 /// with exact unit normals. `segments = 32, rings = 16` → 960
@@ -289,5 +292,44 @@ fn benches(c: &mut Criterion) {
     );
 }
 
-criterion_group!(render_benches, benches);
+/// Path tracer: a full 64-spp Cornell box frame (the README / BENCHMARKS
+/// headline), one progressive `refine(1)` pass (the interactive
+/// viewer's per-frame cost), and a glossy sphere at 16 spp.
+fn pathtrace_benches(c: &mut Criterion) {
+    let mut g = c.benchmark_group("pathtrace");
+    g.sample_size(10);
+    let cornell = oxideav_render::testscenes::cornell_box();
+    let spp = |n: u32| PathTraceOptions {
+        samples_per_pixel: n,
+        ..PathTraceOptions::default()
+    };
+    let cornell64 = RenderOptions {
+        scene_camera: Some(0),
+        path_trace: spp(64),
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+    let mut renderer = make_renderer(RenderBackend::PathTrace).expect("pathtrace");
+    g.bench_function("pathtrace_cornell_64spp_256", |b| {
+        b.iter(|| black_box(renderer.render(black_box(&cornell), &cornell64).unwrap()))
+    });
+    let mut tracer = PathTracer::new();
+    tracer.sync(&cornell, &cornell64);
+    g.bench_function("pathtrace_cornell_refine1_256", |b| {
+        b.iter(|| {
+            tracer.refine(1);
+            black_box(tracer.image())
+        })
+    });
+    let sphere = sphere_scene(32, 16);
+    let sphere16 = RenderOptions {
+        path_trace: spp(16),
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+    g.bench_function("pathtrace_sphere_960tri_16spp_256", |b| {
+        b.iter(|| black_box(renderer.render(black_box(&sphere), &sphere16).unwrap()))
+    });
+    g.finish();
+}
+
+criterion_group!(render_benches, benches, pathtrace_benches);
 criterion_main!(render_benches);

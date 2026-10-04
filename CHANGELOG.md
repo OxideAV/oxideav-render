@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`RenderBackend::PathTrace`** (`pathtrace`, registry name
+  `"pathtrace"`): unbiased unidirectional Monte Carlo path tracer
+  (Kajiya 1986). Next-event estimation to every `KHR_lights_punctual`
+  light and to one power-sampled emissive triangle (uniform area) or
+  environment texel per vertex, power-heuristic MIS against BSDF
+  sampling (Veach 1997), Russian roulette, optional firefly clamp.
+  BSDF: glTF metallic-roughness with GGX visible-normal sampling
+  (Heitz 2018), cosine diffuse and Fresnel-weighted lobe selection
+  (mixture pdfs), `KHR_materials_transmission` (thin-walled and
+  Walter 2007 rough refraction), `_volume` (Beer-Lambert), `_ior`,
+  `_specular`, `_clearcoat`, `_sheen` (Charlie), emissive. MASK any-hit,
+  BLEND stochastic transparency, normal maps, double-sided surfaces.
+  Owen-scrambled Sobol' sequences (Burley 2020) with PCG-hash seeding
+  and a documented dimension layout; deterministic output.
+  `RenderOptions::path_trace: PathTraceOptions` (samples per pixel,
+  max bounces, roulette start, clamp, seed, `LightStrategy`).
+- **Progressive `PathTracer`**: `sync` / `refine` / `image` / `hdr`
+  with radiance-aware reset; `EnvironmentMap` (equirectangular
+  `HdrImage`, 2-D luminance CDF importance sampling);
+  `PathTraceRenderer`.
+- **`trace`**: shared ray-tracing layer (`TraceScene` world-space BVH
+  with filtered closest / any-hit queries, surface interpolation,
+  material evaluation at a hit, ray-cone texture LOD, Wächter-Binder
+  ray offsets).
+- `dump_testscenes` example takes an optional backend + spp.
+
 - **Public scene-preparation layer** (`prepare`): `PreparedScene` —
   world-space de-indexed `DrawItem`s (triangles / lines / points) with
   animation sampled at a time, morph weights, CPU skinning, generated

@@ -1,6 +1,7 @@
 //! # oxideav-render
 //!
-//! **Status:** Phase D — scanline + Whitted raycast backends live.
+//! **Status:** Phase E — scanline, Whitted raycast and Monte Carlo
+//! path-tracing backends live.
 //!
 //! Pure-Rust 3D-scene → raster image/video renderer for the
 //! [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
@@ -16,7 +17,8 @@
 //! in with a BVH-accelerated Whitted recursive ray tracer covering
 //! the same option surface — including the full glTF `Pbr` model —
 //! plus ray-traced hard shadows, recursive reflection / refraction
-//! and see-through alpha blending. The path-tracer backend lands in Phase E.
+//! and see-through alpha blending. Phase E adds the unbiased Monte Carlo path
+//! tracer ([`pathtrace`]) with a progressive [`PathTracer`] accumulator.
 //!
 //! All backends sit on shared, public, backend-agnostic layers:
 //! [`prepare`] (scene → world-space render list with animation,
@@ -35,8 +37,8 @@
 //! | A     | `Renderer` trait + `RenderBackend::Scanline` + `make_renderer` stub.          |
 //! | B     | Scanline backend (Gouraud / Phong / Wireframe / Flat / NormalDebug / Depth).  |
 //! | C     | `oxideav-pipeline` `DagNode::Render3D` source — emits `Frame::Video`.         |
-//! | D *(now)* | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
-//! | E     | `RenderBackend::PathTrace` — Kajiya path tracing + Disney/Burley BRDF.        |
+//! | D     | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
+//! | E *(now)* | `RenderBackend::PathTrace` — Kajiya path tracing, NEE + MIS, glTF BSDF.   |
 //!
 //! ## Quick start
 //!
@@ -61,8 +63,8 @@
 //! Render math is sourced from published academic papers — Pineda 1988
 //! (half-space rasterisation), Bresenham 1965 (line walker), Möller–
 //! Trumbore 1997 (ray-triangle intersection, Phase D), Burley 2012
-//! SIGGRAPH course (Disney BRDF, Phase E), Kajiya 1986 (path-tracing
-//! equation, Phase E) — plus IEC 61966-2-1 for sRGB encoding.
+//! SIGGRAPH course (roughness remapping), Kajiya 1986 (rendering
+//! equation), Veach 1997 (MIS), Heitz 2018 (VNDF sampling) — plus IEC 61966-2-1 for sRGB encoding.
 //! No external renderer's source code is consulted. glTF KHR extensions
 //! provide the material vocabulary; output crosswalk to PNG / OpenEXR
 //! / video uses the existing oxideav encoder crates.
