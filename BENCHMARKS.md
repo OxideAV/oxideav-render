@@ -51,6 +51,44 @@ the serial prepare + triangle setup dominate, which is why Flat, Phong
 and PBR cost about the same. Shadow maps add one 1024² depth pass per
 directional or spot light.
 
+## Raycast on the prep + trace layers (2026-10-04)
+
+Same x86_64 Linux host as the table above (64 hardware threads, shared
+with other jobs — expect ±10 % noise), rustc 1.98 release bench
+profile. The raycast backend traces 16×16 tiles on every hardware
+thread (≥ 4 tiles per worker).
+
+| Scenario | Scanline | Raycast |
+| --- | --- | --- |
+| `*_flat_960tri_256` | 1.83 ms | 3.37 ms |
+| `*_phong_960tri_256` (raycast: + shadow / mirror rays) | 1.97 ms | 3.47 ms |
+| `*_pbr_960tri_256` | 2.54 ms | 4.48 ms |
+| `*_pbr_shadows_960tri_256` (maps vs shadow rays) | 7.15 ms | 3.93 ms |
+| `*_pbr_cornell_shadows_aa2_256` (point light: maps skip it, rays don't) | 5.94 ms | 7.32 ms |
+| `*_pbr_sphere_grid_shadows_256` (20.7k tri; raycast adds reflections) | 14.17 ms | 6.52 ms |
+| `*_phong_960tri_aa4_128` | 4.41 ms | 7.08 ms |
+| `raycast_phong_3968tri_256` | — | 5.39 ms |
+| `raycast_mirror_floor_256` | — | 3.12 ms |
+| `raycast_bake_only_3968tri_1` (prepare + BVH) | — | 0.25 ms |
+
+- **Shadows are cheaper by ray** at these sizes: one occlusion ray per
+  lit pixel beats rasterising a 1024² shadow map per light, and point
+  lights get shadows at all.
+- **BVH builder choice dominates mid-size scenes.** The binned-SAH
+  build costs ~0.5 µs per triangle (10.5 ms for the 20.7k-triangle
+  sphere grid) — more than tracing a 256² frame. Raycast now builds an
+  object-median BVH (1.7 ms, SAH cost +17 %) unless the frame traces
+  ≥ 16 camera samples per triangle: sphere grid 15.7 → 6.5 ms,
+  bake-only 1.9 → 0.25 ms.
+- **Worker count:** capping tile workers at 8 / 16 / 32 measured
+  5.6 / 4.7 / 3.5 ms on `raycast_pbr_960tri_256` — tracing is
+  compute-bound, so the backend uses every hardware thread.
+- Flat / Phong raycast rows are slower than the old band-parallel
+  numbers on this host because every mode now prepares the scene
+  (morph / skin / de-index + material table) and resolves through the
+  float frame shared with scanline (linear SSAA + tone map) instead of
+  writing sRGB bytes directly.
+
 ## Reading the numbers
 
 - **Banded row parallelism** (std scoped threads, zero new

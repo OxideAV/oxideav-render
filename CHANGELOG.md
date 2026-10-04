@@ -41,12 +41,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   camera; an orbit `CameraSpec::distance` now zooms orthographic
   views; `Renderer::set_texture_resolver` (default no-op, implemented
   by the scanline backend) gives any backend a texture decoder.
+- **Raycast `ShadingMode::Pbr`**: the Whitted ray tracer now renders the
+  shared `PreparedScene` (animation, morphs, skinning) through
+  `Camera::resolve` and the new `trace` layer, evaluating the scanline
+  glTF formulas at every hit (all texture slots, vertex colours, normal
+  maps, `KHR_texture_transform`, unlit, emissive, double-sided /
+  culled back faces) — pixel-identical to scanline without secondary
+  rays — plus ray-traced hard shadows for every light type (MASK /
+  BLEND / transmission aware), MASK any-hit filtering, BLEND by
+  continued rays composited in linear space, Fresnel-weighted mirror
+  reflection with a roughness cut-off, and refraction through
+  `KHR_materials_transmission` (thin-walled) / `KHR_materials_volume`
+  (Snell, total internal reflection, Beer–Lambert absorption).
+  Texture LOD from ray differentials on camera rays, ray cones after
+  bounces.
+- `RaycastRenderer`: native `render_hdr`, `set_texture_resolver`,
+  `with_texture_resolver`, `texture_cache_mut`.
+- `RenderOptions::max_ray_depth` (default 4) and
+  `RenderOptions::reflection_roughness_cutoff` (default 0.5).
+- `trace` additions: `TexLod::Grad` + `TraceScene::barycentric_differentials`
+  (ray differentials), `material_oriented`, `shadow_transmittance`,
+  `direct_light`, `with_build_options`, `reflect` / `refract` /
+  `schlick` / `barycentric_of` / `pixel_spread`.
+- `tests/raycast_pbr.rs`: scanline parity on eight test scenes,
+  shadow, reflection, refraction, MASK / BLEND, HDR and resolver tests.
 - `testscenes`: procedural reference scenes + image metrics for
   cross-backend tests; `tests/scanline_pbr.rs` property suite with raw
   goldens; `examples/dump_testscenes`.
 
 ### Changed
 
+- Raycast backend rebuilt on the prep + trace layers: framing, posing
+  and lighting match scanline / GPU; every mode resolves through the
+  scanline frame contract (linear SSAA, tone map, verbatim
+  background); 16×16 tiles on `std::thread::scope` workers with an
+  atomic queue (deterministic); object-median BVH when few rays per
+  triangle are traced, binned SAH otherwise. Legacy modes keep their
+  output (`Phong` keeps its Whitted rays). Lines / points stay
+  invisible to rays.
 - Scanline backend rebuilt on the prep layer: homogeneous frustum
   clipping (triangles crossing the near plane are clipped instead of
   dropped), perspective-correct interpolation, top-left fill rule

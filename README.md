@@ -15,7 +15,7 @@ layer:
 | Backend     | Status                                                       |
 | ----------- | ----------------------------------------------------------- |
 | `Scanline`  | done — clipped, perspective-correct, tile-parallel rasteriser; glTF 2.0 metallic-roughness `Pbr` mode (textures, normal / occlusion / emissive maps, vertex colours, unlit, punctual lights, OPAQUE / MASK / BLEND, back-face culling, shadow maps with PCF) plus the legacy Flat / Gouraud / Phong / Wireframe / NormalDebug / DepthDebug modes |
-| `Raycast`   | done — Whitted recursive ray tracer: six legacy shading modes + raytraced hard shadows, recursive reflection / refraction in `Phong` mode (renders `Pbr` as `Phong` for now); BVH-accelerated |
+| `Raycast`   | done — Whitted recursive ray tracer on the prep + trace layers: the scanline glTF `Pbr` model per hit (pixel-identical to scanline without secondary rays) plus ray-traced hard shadows for every light type, Fresnel-weighted mirror reflection, refraction (`KHR_materials_transmission` / `_volume` / `_ior`), MASK any-hit and BLEND see-through rays; legacy modes unchanged; HDR output; tile-parallel |
 | `PathTrace` | not yet — path tracing + physically-based BRDF              |
 
 ### Shared layers (public, backend-agnostic)
@@ -53,6 +53,15 @@ identically:
 * **`hdr`** — `HdrImage` (scene-linear `f32` RGBA, via
   `Renderer::render_hdr`, for EXR-style output), `ToneMap::{Clamp,
   Reinhard, AcesFitted}` + `exposure`, sRGB transfer.
+* **`trace`** — the ray-tracing layer shared by `Raycast` and
+  `PathTrace`: `TraceScene` (one world-space SAH / object-median BVH
+  over the prepared triangles, watertight intersection, hits mapped
+  back to draw items, filtered closest / any-hit queries), hit →
+  surface and glTF material evaluation (`material_oriented` for
+  double-sided back faces), texture LOD from ray differentials
+  (`TexLod::Grad`) or ray cones (`TexLod::Cone`), shadow
+  transmittance (MASK / BLEND / transmission), BRDF direct lighting,
+  robust origin offsetting, Snell / Schlick helpers.
 * **`testscenes`** — procedural reference scenes (Cornell-style box,
   metallic × roughness sphere grid, checker floor, textured quad,
   alpha MASK / BLEND planes, shadow box, skinned + morph-animated
@@ -87,15 +96,40 @@ fn render_one(scene: &Scene3D) -> Result<()> {
 `Projection`, `BackgroundColor`, a fallback directional `LightSpec`, an
 orbit `CameraSpec`, SSAA (`aa ∈ 1..=8`), and the newer `tone_map`,
 `exposure`, `time` / `animation`, `scene_camera`, `use_scene_lights`,
-`ambient`, `shadows` / `shadow_map_size` and `material_variant`
-fields. The default is 512×512, Phong shading, perspective
+`ambient`, `shadows` / `shadow_map_size`, `material_variant`,
+`max_ray_depth` and `reflection_roughness_cutoff` fields. The default is 512×512, Phong shading, perspective
 projection, clamp tone map — i.e. the historical output. Always build
 it with `..RenderOptions::default()` so new options default.
 
+### Raycast specifics
+
+`ShadingMode::Pbr` on `Raycast` evaluates exactly the scanline formulas
+at each hit, so with `max_ray_depth: 0` and `shadows: false` the two
+backends agree to rounding on every shared test scene. On top:
+
+* `shadows: true` traces a hard shadow ray per light (directional,
+  point and spot) instead of shadow maps; MASK cut-outs pass light,
+  BLEND surfaces pass `1 − α`, transmissive surfaces tint.
+* Reflection: one Fresnel-weighted (`F(n·v)` of the material `F0`)
+  mirror ray; it fades in below `reflection_roughness_cutoff`
+  (default 0.5) as `(1 − roughness / cutoff)²`, the uniform
+  `ambient · ao · F0` environment term covering the rest.
+* Refraction: `KHR_materials_transmission` replaces the transmitted
+  share of the diffuse lobe by a refracted ray — straight through for
+  thin walls, Snell + total internal reflection + Beer–Lambert
+  absorption for `KHR_materials_volume` bodies.
+* BLEND surfaces continue the ray and composite *over* in linear space.
+* Escaping secondary rays see a uniform environment of radiance
+  `ambient`; camera rays see the background.
+* `max_ray_depth` (default 4) bounds the bounces.
+* Texture LOD: ray differentials on camera rays (identical filtering to
+  scanline), ray cones after a bounce.
+
 Textures decode through the renderer's `TextureCache`; construct
 `ScanlineRenderer::with_texture_resolver(Arc::new(
-RegistryTextureResolver::new(ctx)))` to decode PNG / JPEG / … through
-the framework registry.
+RegistryTextureResolver::new(ctx)))` (or `RaycastRenderer::…`, or
+`Renderer::set_texture_resolver` on any backend) to decode PNG / JPEG
+/ … through the framework registry.
 
 `RenderOptions::validate() -> Result<()>` runs a typed pre-flight
 check of every field and surfaces the first offending one via
@@ -130,8 +164,9 @@ The 3D input type stays `oxideav_mesh3d::Scene3D`.
 
 `benches/render.rs` (criterion) tracks both backends on procedural
 scenes (including the PBR / shadow-map paths); baseline numbers +
-analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). Both backends are
-band-parallel over std scoped threads with deterministic output.
+analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). The CPU backends
+are parallel over std scoped threads (bands / tiles) with
+deterministic output.
 
 `cargo run -p oxideav-render --release --example dump_testscenes --
 out/` renders every reference scene to PNG.
@@ -141,7 +176,9 @@ out/` renders every reference scene to PNG.
 Render math is sourced from published papers and specifications —
 glTF 2.0 + Appendix B, `KHR_lights_punctual`, Pineda 1988,
 Sutherland–Hodgman 1974, Liang–Barsky 1984, Heckbert–Moreton 1991,
-Williams 1978 / 1983, Reeves et al. 1987, Walter et al. 2007, Heitz
+Williams 1978 / 1983, Reeves et al. 1987, Whitted 1980, Igehy 1999,
+Akenine-Möller et al. 2019, Woop et al. 2013, Wald 2007, Wächter &
+Binder 2019, Walter et al. 2007, Heitz
 2014, Schlick 1994, Burley 2012, Reinhard et al. 2002, Narkowicz's
 ACES fit, Porter–Duff 1984, IEC 61966-2-1. Reference renderer source
 code is not consulted. glTF KHR extensions provide the
