@@ -134,6 +134,13 @@ pub trait Renderer: Send {
     ) -> Result<HdrImage> {
         Ok(HdrImage::from_rgba8(&self.render(scene, opts)?))
     }
+    /// Install the image decoder used for scene textures. Backends
+    /// that sample textures replace their texture cache (dropping
+    /// previously decoded images); backends that do not sample
+    /// textures (today: `Raycast`) ignore it — the default.
+    fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
+        let _ = resolver;
+    }
 }
 
 /// Construct a renderer for `backend`.
@@ -202,6 +209,10 @@ impl Renderer for ScanlineRenderer {
             opts,
             &mut self.cache,
         ))
+    }
+
+    fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
+        self.cache.set_resolver(resolver);
     }
 }
 

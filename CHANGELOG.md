@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RenderOptions`: `tone_map`, `exposure`, `time`, `animation`,
   `scene_camera`, `use_scene_lights`, `ambient`, `shadows`,
   `shadow_map_size`, `material_variant`.
+- `RenderOptions::camera_target_offset` pans the auto-frame / orbit
+  camera; an orbit `CameraSpec::distance` now zooms orthographic
+  views; `Renderer::set_texture_resolver` (default no-op, implemented
+  by the scanline backend) gives any backend a texture decoder.
 - `testscenes`: procedural reference scenes + image metrics for
   cross-backend tests; `tests/scanline_pbr.rs` property suite with raw
   goldens; `examples/dump_testscenes`.

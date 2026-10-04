@@ -470,10 +470,15 @@ fn registry_resolver_decodes_png_textures() {
     );
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_png::register(&mut ctx);
-    let resolver = oxideav_render::RegistryTextureResolver::new(Arc::new(ctx));
-    let mut r = oxideav_render::ScanlineRenderer::with_texture_resolver(Arc::new(resolver));
+    let resolver: Arc<dyn oxideav_render::TextureResolver> =
+        Arc::new(oxideav_render::RegistryTextureResolver::new(Arc::new(ctx)));
+    let mut r = oxideav_render::ScanlineRenderer::with_texture_resolver(resolver.clone());
     use oxideav_render::Renderer;
     let img = r.render(&scene, &o).unwrap();
+    // Same through the backend-agnostic trait hook.
+    let mut dynr = make_renderer(RenderBackend::Scanline).unwrap();
+    dynr.set_texture_resolver(resolver);
+    assert_eq!(dynr.render(&scene, &o).unwrap().pixels, img.pixels);
     assert_eq!(
         px(&img, project(&scene, &o, [-0.75, 0.75, 0.0])),
         [255, 0, 0, 255]

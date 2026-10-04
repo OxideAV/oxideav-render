@@ -167,7 +167,14 @@ pub struct RenderOptions {
     pub light: LightSpec,
     /// Camera placement override. `None` ⇒ auto-frame the scene
     /// bounding box looking down the `+Z` axis toward `-Z`.
+    /// For [`Projection::Orthographic`], `distance` scales the view
+    /// volume (zoom).
     pub camera: Option<CameraSpec>,
+    /// World-space offset added to the auto-frame / orbit look-at
+    /// target (the scene bounds centre) — pans the auto / orbit camera
+    /// (eye and target move together). Ignored for scene cameras.
+    /// Default `[0, 0, 0]`.
+    pub camera_target_offset: [f32; 3],
     /// Supersampling factor `[1, 8]`. `1` = off; higher values render
     /// `N×width × N×height` and box-filter down to the requested
     /// output. Hard cap of `8` because at 8× a 1024² render is a
@@ -226,6 +233,7 @@ impl Default for RenderOptions {
             fov_deg: 60.0,
             light: LightSpec::default_light(),
             camera: None,
+            camera_target_offset: [0.0; 3],
             aa: 1,
             tone_map: ToneMap::Clamp,
             exposure: 1.0,
@@ -262,6 +270,7 @@ impl RenderOptions {
     /// * `light.azimuth_deg` and `light.elevation_deg` are finite.
     /// * If `camera` is `Some`, every field is finite and `distance`
     ///   is `> 0`.
+    /// * `camera_target_offset` is finite.
     /// * `exposure` and `ambient` are finite and `>= 0.0`; `time` (if
     ///   set) is finite; `shadow_map_size` is within `16..=8192`.
     ///
@@ -311,6 +320,12 @@ impl RenderOptions {
             return Err(Error::InvalidOptions(format!(
                 "light.azimuth_deg / light.elevation_deg must be finite, got ({}, {})",
                 self.light.azimuth_deg, self.light.elevation_deg
+            )));
+        }
+        if !self.camera_target_offset.iter().all(|v| v.is_finite()) {
+            return Err(Error::InvalidOptions(format!(
+                "camera_target_offset must be finite, got {:?}",
+                self.camera_target_offset
             )));
         }
         if !self.exposure.is_finite() || self.exposure < 0.0 {

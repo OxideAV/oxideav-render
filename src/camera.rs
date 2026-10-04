@@ -385,10 +385,16 @@ impl Camera {
     /// Build a camera honouring [`RenderOptions::camera`] /
     /// [`RenderOptions::projection`] / [`RenderOptions::fov_deg`].
     pub(crate) fn build(width: u32, height: u32, bbox: BBox, opts: &RenderOptions) -> Self {
+        let off = opts.camera_target_offset;
+        let off = if off.iter().all(|v| v.is_finite()) {
+            off
+        } else {
+            [0.0; 3]
+        };
         let (cx, cy, cz) = (
-            (bbox.min[0] + bbox.max[0]) * 0.5,
-            (bbox.min[1] + bbox.max[1]) * 0.5,
-            (bbox.min[2] + bbox.max[2]) * 0.5,
+            (bbox.min[0] + bbox.max[0]) * 0.5 + off[0],
+            (bbox.min[1] + bbox.max[1]) * 0.5 + off[1],
+            (bbox.min[2] + bbox.max[2]) * 0.5 + off[2],
         );
         let extent = ((bbox.max[0] - bbox.min[0]).max(bbox.max[1] - bbox.min[1]))
             .max(bbox.max[2] - bbox.min[2])
@@ -434,8 +440,15 @@ impl Camera {
             }
             Projection::Orthographic => {
                 // Frame the full extent on the smaller axis with a
-                // 1.2x margin (matching the perspective fit).
-                let half = radius;
+                // 1.2x margin (matching the perspective fit); an orbit
+                // `distance` zooms (scales the view volume) since
+                // moving an orthographic eye changes nothing on screen.
+                let zoom = opts
+                    .camera
+                    .map(|c| c.distance)
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .unwrap_or(1.0);
+                let half = radius * zoom;
                 let half_w = if aspect >= 1.0 { half * aspect } else { half };
                 let half_h = if aspect >= 1.0 { half } else { half / aspect };
                 let near = (dist_units - extent * 2.0).min(-extent);
@@ -782,6 +795,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn target_offset_pans_and_ortho_distance_zooms() {
+        let base = Camera::build(64, 64, unit_bbox(), &RenderOptions::default());
+        let panned = Camera::build(
+            64,
+            64,
+            unit_bbox(),
+            &RenderOptions {
+                camera_target_offset: [1.0, 0.5, 0.0],
+                ..RenderOptions::default()
+            },
+        );
+        assert!((panned.eye[0] - base.eye[0] - 1.0).abs() < 1e-5);
+        assert!((panned.eye[1] - base.eye[1] - 0.5).abs() < 1e-5);
+        assert_eq!(panned.forward, base.forward);
+        let ortho = |distance: f32| {
+            Camera::build(
+                64,
+                64,
+                unit_bbox(),
+                &RenderOptions {
+                    projection: Projection::Orthographic,
+                    camera: Some(CameraSpec {
+                        elevation_deg: 0.0,
+                        azimuth_deg: 0.0,
+                        distance,
+                    }),
+                    ..RenderOptions::default()
+                },
+            )
+        };
+        assert!((ortho(2.0).half_h - 2.0 * ortho(1.0).half_h).abs() < 1e-5);
     }
 
     #[test]
