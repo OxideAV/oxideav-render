@@ -51,6 +51,7 @@ pub(crate) fn shade_pixel(base: [f32; 4], normal: [f32; 3], light: &DirLight) ->
 
 /// Encode a linear-space RGBA colour (`0..=1` floats) into packed
 /// sRGB bytes; alpha stays linear.
+#[cfg(test)]
 pub(crate) fn linear_rgba_to_srgb_u8(c: [f32; 4]) -> [u8; 4] {
     [
         linear_to_srgb_u8(c[0]),
@@ -62,6 +63,7 @@ pub(crate) fn linear_rgba_to_srgb_u8(c: [f32; 4]) -> [u8; 4] {
 
 /// Encode one linear-space channel into an sRGB byte per the
 /// IEC 61966-2-1 piecewise curve.
+#[cfg(test)]
 pub(crate) fn linear_to_srgb_u8(c: f32) -> u8 {
     let c = c.clamp(0.0, 1.0);
     let v = if c <= 0.003_130_8 {

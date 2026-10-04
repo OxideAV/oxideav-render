@@ -1,4 +1,4 @@
-//! Camera framing + scene bounding-box walk shared by every backend.
+//! Camera framing shared by every backend.
 //!
 //! The scanline backend consumes the [`Camera`]'s `view` / `proj`
 //! matrices for vertex projection; the raycast backend consumes the
@@ -26,12 +26,7 @@
 //! [`Camera::projection_matrix`] emits either convention
 //! ([`DepthRange`]) for Vulkan / wgpu / D3D style `[0, 1]` depth.
 
-use oxideav_mesh3d::{NodeId, Scene3D};
-
-use crate::math::{
-    identity4, mat4_mul, mat4_mul_vec4, vec3_add, vec3_cross, vec3_dot, vec3_normalise, vec3_scale,
-    vec3_sub,
-};
+use crate::math::{mat4_mul, vec3_add, vec3_cross, vec3_dot, vec3_normalise, vec3_scale, vec3_sub};
 use crate::options::{CameraSpec, Projection, RenderOptions};
 
 // ---------------------------------------------------------------------
@@ -43,111 +38,6 @@ use crate::options::{CameraSpec, Projection, RenderOptions};
 pub(crate) struct BBox {
     pub(crate) min: [f32; 3],
     pub(crate) max: [f32; 3],
-}
-
-impl BBox {
-    pub(crate) fn empty() -> Self {
-        Self {
-            min: [f32::INFINITY; 3],
-            max: [f32::NEG_INFINITY; 3],
-        }
-    }
-
-    pub(crate) fn extend(&mut self, p: [f32; 3]) {
-        for (i, &v) in p.iter().enumerate() {
-            if v < self.min[i] {
-                self.min[i] = v;
-            }
-            if v > self.max[i] {
-                self.max[i] = v;
-            }
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.min[0] > self.max[0]
-    }
-}
-
-/// Walk the scene's node forest and accumulate the world-space AABB
-/// over every mesh vertex. An empty / geometry-free scene returns a
-/// unit half-extent box centred on the origin so the camera maths
-/// stays finite. Non-finite vertex coordinates never survive the
-/// min/max comparison, so a NaN-poisoned mesh cannot poison the
-/// camera.
-pub(crate) fn scene_bbox(scene: &Scene3D) -> BBox {
-    let mut bbox = BBox::empty();
-    walk_scene_preorder(scene, |node, world| {
-        if let Some(mesh_id) = node.mesh {
-            if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-                for prim in &mesh.primitives {
-                    for p in &prim.positions {
-                        let v = mat4_mul_vec4(world, [p[0], p[1], p[2], 1.0]);
-                        if v[3].abs() > f32::EPSILON {
-                            bbox.extend([v[0] / v[3], v[1] / v[3], v[2] / v[3]]);
-                        }
-                    }
-                }
-            }
-        }
-    });
-    if bbox.is_empty() {
-        BBox {
-            min: [-0.5, -0.5, -0.5],
-            max: [0.5, 0.5, 0.5],
-        }
-    } else {
-        bbox
-    }
-}
-
-/// Depth-first pre-order walk over the scene's node forest, calling
-/// `f(node, world_matrix)` per reachable node. Iterative (explicit
-/// stack), so traversal depth is bounded by heap, not call stack —
-/// a 100k-deep parent chain walks fine.
-///
-/// The scene graph is an arena of parent -> child index references,
-/// so nothing stops a scene from containing a cycle or a node shared
-/// by two parents. This walk claims each node **once at first
-/// arrival** (shared children resolve through the first parent's
-/// chain; left-to-right root and child order is preserved) — the
-/// same traversal contract as `oxideav_mesh3d::Scene3D`'s own ray /
-/// bounds walks — which turns a corrupt or hostile cyclic graph from
-/// an unbounded recursion into a plain finite render. Out-of-range
-/// node ids are skipped.
-pub(crate) fn walk_scene_preorder(
-    scene: &Scene3D,
-    mut f: impl FnMut(&oxideav_mesh3d::Node, &[[f32; 4]; 4]),
-) {
-    let mut visited = vec![false; scene.nodes.len()];
-    // Children are pushed in reverse so the leftmost pops first,
-    // preserving the recursive pre-order visit sequence exactly.
-    let mut stack: Vec<(NodeId, [[f32; 4]; 4])> = scene
-        .roots
-        .iter()
-        .rev()
-        .map(|&r| (r, identity4()))
-        .collect();
-    while let Some((id, parent_world)) = stack.pop() {
-        let claimed = match visited.get_mut(id.0 as usize) {
-            Some(slot) if !*slot => {
-                *slot = true;
-                true
-            }
-            _ => false,
-        };
-        if !claimed {
-            continue;
-        }
-        let Some(node) = scene.nodes.get(id.0 as usize) else {
-            continue;
-        };
-        let world = mat4_mul(parent_world, node.transform.to_matrix());
-        f(node, &world);
-        for &child in node.children.iter().rev() {
-            stack.push((child, world));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -622,7 +512,7 @@ pub(crate) fn orthographic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::mat4_mul_point;
+    use crate::math::{identity4, mat4_mul_point, mat4_mul_vec4};
     use crate::options::CameraSpec;
 
     fn unit_bbox() -> BBox {
@@ -877,13 +767,5 @@ mod tests {
         );
         assert_eq!(ortho.projection, Projection::Orthographic);
         assert_eq!(ortho.half_h, 3.0);
-    }
-
-    #[test]
-    fn empty_scene_bbox_is_unit_box() {
-        let scene = Scene3D::new();
-        let bbox = scene_bbox(&scene);
-        assert_eq!(bbox.min, [-0.5, -0.5, -0.5]);
-        assert_eq!(bbox.max, [0.5, 0.5, 0.5]);
     }
 }

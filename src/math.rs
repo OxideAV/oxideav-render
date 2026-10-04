@@ -39,6 +39,7 @@ pub(crate) fn mat4_mul_vec4(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
 }
 
 /// Transform a 3D point (`w = 1`) through `m` with perspective divide.
+#[cfg(test)]
 pub(crate) fn mat4_mul_point(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
     let v = mat4_mul_vec4(m, [p[0], p[1], p[2], 1.0]);
     if v[3].abs() > f32::EPSILON {
@@ -46,16 +47,6 @@ pub(crate) fn mat4_mul_point(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
     } else {
         [v[0], v[1], v[2]]
     }
-}
-
-/// Multiply the 3×3 upper-left of `m` by `v`. Used to transform
-/// directions (normals) without picking up the translation column.
-pub(crate) fn mat3_mul_vec3(m: &[[f32; 4]; 4], v: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
 }
 
 /// `a + b`.

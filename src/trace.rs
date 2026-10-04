@@ -99,7 +99,7 @@ pub enum TexLod {
     /// SIGGRAPH 1999): the change of the hit barycentrics per output
     /// pixel along screen `x` / `y`, obtained by intersecting the
     /// neighbouring pixels' rays with the hit triangle's plane
-    /// ([`barycentric_differentials`]). UV derivatives follow exactly
+    /// ([`TraceScene::barycentric_differentials`]). UV derivatives follow exactly
     /// as in the rasteriser, so primary-ray filtering matches the
     /// scanline backend.
     Grad {

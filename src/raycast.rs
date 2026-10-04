@@ -1,603 +1,768 @@
-//! Raycast backend — the Phase D renderer behind
+//! Raycast backend — the Whitted recursive ray tracer behind
 //! [`crate::RenderBackend::Raycast`].
 //!
-//! Whitted-style recursive ray tracing: one primary ray per pixel
-//! sample (times the SSAA factor), closest-hit shading with the same
-//! directional light as the scanline backend, plus (in
-//! [`ShadingMode::Phong`]) shadow rays and recursive reflection /
-//! refraction rays driven by the hit material.
+//! The scene goes through the same shared layers as every other
+//! backend: [`PreparedScene`] (animation at [`RenderOptions::time`],
+//! morph targets, CPU skinning, world-space attributes, materials,
+//! textures, lights), [`Camera::resolve`] (identical framing — rays
+//! come from [`Camera::primary_ray`]) and [`crate::trace::TraceScene`]
+//! (one SAH BVH over the prepared triangles, watertight intersection,
+//! hit → attribute interpolation, glTF material inputs). Line and point
+//! items have no surface area and are invisible to rays.
 //!
-//! Clean-room policy: the recursive-ray-tracing structure follows
-//! Whitted's 1980 CACM paper "An Improved Illumination Model for
-//! Shaded Display". Ray-triangle intersection is Möller–Trumbore 1997
-//! via `oxideav_mesh3d::ray`; BVH construction is
-//! [`oxideav_mesh3d::Bvh`]. Reflection / refraction directions use
-//! the standard vector forms of the law of reflection and Snell's
-//! law; the reflectance weight uses Schlick's 1994 Fresnel
-//! approximation. No reference renderer source code was consulted.
+//! ## Shading modes
 //!
-//! ## Scene baking
+//! * `Flat` / `Gouraud` / `Phong` / `Wireframe` / `NormalDebug` /
+//!   `DepthDebug` keep the historical model shared with the scanline
+//!   backend ([`crate::shade`]): base-colour factor, the options'
+//!   directional light, constant 0.2 ambient. `Phong` additionally
+//!   traces Whitted's rays (Whitted, "An Improved Illumination Model
+//!   for Shaded Display", CACM 23(6), 1980): a hard shadow ray to the
+//!   light, a mirror ray weighted by `metallic · (1 − roughness)` and
+//!   Schlick's Fresnel, and a refraction ray for
+//!   `KHR_materials_transmission`. `Wireframe` paints a barycentric
+//!   edge band of each closest hit.
+//! * `Pbr` evaluates the scanline backend's glTF 2.0 metallic-roughness
+//!   formulas at every hit — [`crate::brdf`] direct lighting from every
+//!   [`crate::prepare::PreparedLight`], ambient
+//!   `ambient · ao · (c_diff + F0)`, emissive, unlit, all texture slots,
+//!   vertex colours, normal maps, `KHR_texture_transform`, double-sided
+//!   back faces with flipped normals, back-face culling of single-sided
+//!   materials — and adds what rays can do:
+//!   - **Hard shadows** ([`RenderOptions::shadows`]) by shadow rays for
+//!     every light type (point lights included) instead of shadow
+//!     maps, with `MASK` cut-outs letting light through, `BLEND`
+//!     surfaces passing `1 − α` and transmissive surfaces tinting
+//!     ([`crate::trace::TraceScene::shadow_transmittance`]).
+//!   - **`MASK`** as an any-hit filter on every ray (camera, secondary
+//!     and shadow).
+//!   - **`BLEND`** by continuing the ray through the surface and
+//!     compositing the result under it with the straight-alpha *over*
+//!     operator in linear space (Porter & Duff 1984) — exact
+//!     per-pixel ordering instead of a sorted blend pass.
+//!   - **Reflection** (Whitted): one perfect-mirror ray about the
+//!     shading normal, weighted by the Schlick Fresnel `F(n·v)` of the
+//!     material's `F0` (so metals reflect their tinted colour and
+//!     dielectrics ~4 % head-on). A single mirror ray cannot represent
+//!     a glossy lobe, so roughness is handled by a cut-off
+//!     ([`RenderOptions::reflection_roughness_cutoff`]): the traced
+//!     reflection fades in as `g = (1 − roughness / cutoff)²` and the
+//!     uniform environment term `ambient · ao · F0` keeps the remaining
+//!     `1 − g` — at or above the cut-off the result is exactly the
+//!     scanline formula.
+//!   - **Refraction** (`KHR_materials_transmission` + `KHR_materials_ior`):
+//!     the transmitted share `transmission · (1 − metallic) · (1 − F)`
+//!     of the diffuse lobe is replaced by a refracted ray tinted by the
+//!     base colour (the diffuse term keeps `1 − transmission`). Without
+//!     `KHR_materials_volume` the surface is thin-walled and the ray
+//!     passes straight through (as the extension specifies); with a
+//!     volume the ray bends by Snell's law on entry and exit, reflects
+//!     internally on total internal reflection, and is attenuated by
+//!     Beer–Lambert absorption `exp(−σ·d)`,
+//!     `σ = −ln(attenuationColor) / attenuationDistance`.
 //!
-//! [`TraceScene::build`] flattens the node forest once per render:
-//! every triangle-topology primitive is expanded through
-//! `Primitive::triangle_indices()` (so strips / fans arrive
-//! pre-unrolled with correct winding), transformed to world space,
-//! and appended to a single triangle soup — three positions per
-//! triangle, no shared vertices. A parallel per-triangle array
-//! carries the world-space vertex normals (per-vertex when the source
-//! primitive has them, face normal otherwise) and a material slot.
-//! [`oxideav_mesh3d::Bvh`] (binned SAH) is built over the baked soup;
-//! queries go through its allocation-free ordered traversal
-//! (`Bvh::closest_hit` / `Bvh::occluded`) against the baked
-//! positions.
+//!   Secondary rays that escape the scene see a uniform environment of
+//!   radiance [`RenderOptions::ambient`] (the same environment the
+//!   ambient term assumes); camera rays — directly or through `BLEND`
+//!   layers — see the background canvas. Recursion stops at
+//!   [`RenderOptions::max_ray_depth`] bounces; at depth 0 the surface
+//!   is shaded exactly like the scanline backend (opaque, no traced
+//!   reflection or refraction).
 //!
-//! Line / point topologies have zero surface area and are invisible
-//! to rays; the raycast backend skips them (the scanline backend
-//! remains the renderer for wire/point content).
+//! ## Texture filtering
+//!
+//! Camera rays carry ray differentials (Igehy, "Tracing Ray
+//! Differentials", SIGGRAPH 1999): the rays through the next pixel
+//! along `x` and `y`, intersected with the hit triangle's plane, give
+//! the barycentric derivatives per pixel — the same derivatives the
+//! rasteriser takes, so primary-hit (and `BLEND` / thin-wall
+//! see-through) texture filtering matches the scanline backend. After a
+//! reflection or refraction the footprint becomes a ray cone
+//! (Akenine-Möller et al., "Texture Level of Detail Strategies for
+//! Real-Time Ray Tracing", Ray Tracing Gems ch. 20, 2019) starting at
+//! the differential footprint's width and spreading by the camera's
+//! per-pixel angle (curvature ignored). Any-hit alpha tests sample
+//! level 0.
+//!
+//! ## Output
+//!
+//! Every render-resolution sample (SSAA `aa × aa` per output pixel)
+//! fills the scanline backend's `Frame` (scene-linear colour +
+//! coverage), so the resolve contract is identical: background
+//! samples come back verbatim, covered samples go through exposure,
+//! [`crate::ToneMap`] and sRGB, SSAA averages premultiplied. Samples
+//! are traced on `std::thread::scope` workers pulling 16×16 tiles
+//! from an atomic counter; every sample is a pure function of its
+//! position, so the output is bit-identical for any thread count.
+//!
+//! Clean-room: algorithms come from the cited papers and the glTF 2.0 /
+//! KHR extension specifications. No renderer source code was consulted.
 
-use oxideav_mesh3d::ray::{PreparedRay, Ray, RayQuery};
-use oxideav_mesh3d::{Bvh, Primitive, Scene3D, Topology};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::camera::{scene_bbox, Camera};
-use crate::image::{downsample_box, RgbaImage};
-use crate::math::{
-    mat3_mul_vec3, mat4_mul_point, vec3_add, vec3_cross, vec3_dot, vec3_normalise, vec3_scale,
-    vec3_sub,
-};
+use oxideav_mesh3d::{AlphaMode, Scene3D};
+
+use crate::brdf::{f_schlick, BrdfParams};
+use crate::camera::Camera;
+use crate::hdr::{srgb_u8_lut, HdrImage};
+use crate::image::RgbaImage;
+use crate::math::{vec3_dot, vec3_normalise, vec3_scale};
 use crate::options::{RenderOptions, ShadingMode};
-use crate::shade::{build_light, linear_rgba_to_srgb_u8, shade_pixel, DirLight, AMBIENT};
+use crate::prepare::{PrepareOptions, PreparedScene};
+use crate::scanline::{depth_to_byte, normal_to_byte, Frame, Sample};
+use crate::shade::{build_light, shade_pixel, DirLight, AMBIENT};
+use crate::texture::TextureCache;
+use crate::trace::{
+    interp3, offset_ray_origin, pixel_spread, reflect, refract, schlick, TexLod, TraceHit,
+    TraceScene,
+};
 
-/// Maximum recursion depth for reflection / refraction rays. Depth 0
-/// is the primary ray; a Whitted tree deeper than this contributes
-/// only the locally-shaded colour.
-const MAX_DEPTH: u32 = 4;
+/// Hard cap on [`RenderOptions::max_ray_depth`].
+const MAX_DEPTH_CAP: u32 = 16;
 
-/// Offset applied along the outgoing ray direction when spawning
-/// shadow / secondary rays so they don't re-hit the surface they
-/// left (shadow-acne guard).
-const RAY_EPSILON: f32 = 1.0e-4;
+/// Maximum number of `BLEND` / thin-wall see-through continuations
+/// along one ray path (bounds the recursion on stacks of
+/// semi-transparent layers).
+const MAX_LAYERS: u32 = 64;
 
-/// Minimum metallic factor before a reflection ray is traced, and
-/// minimum transmission factor before a refraction ray is traced —
-/// spares the ray tree for the overwhelmingly common inert material.
+/// Minimum metallic (legacy `Phong`) / transmission before a secondary
+/// ray is traced.
 const SECONDARY_RAY_THRESHOLD: f32 = 1.0e-2;
 
 /// Barycentric distance from a triangle edge under which a
 /// [`ShadingMode::Wireframe`] hit paints the pixel.
 const WIREFRAME_EDGE_WIDTH: f32 = 0.03;
 
-// ---------------------------------------------------------------------
-// Baked material.
-// ---------------------------------------------------------------------
-
-/// Material snapshot consumed by the ray shader — the subset of
-/// [`oxideav_mesh3d::Material`] the Whitted model can honour, baked
-/// once so the per-hit path never chases scene indices.
-#[derive(Debug, Clone, Copy)]
-struct ShadeMaterial {
-    /// Linear-space RGBA base colour.
-    base_color: [f32; 4],
-    /// `[0, 1]` — drives the reflection ray weight.
-    metallic: f32,
-    /// `[0, 1]` — attenuates the reflection (a rough metal reflects
-    /// diffusely, which a single Whitted ray cannot represent; the
-    /// mirror term fades out with roughness instead).
-    roughness: f32,
-    /// Fraction of light transmitted through the surface
-    /// (`KHR_materials_transmission`); drives the refraction ray.
-    transmission: f32,
-    /// Index of refraction (`KHR_materials_ior`, default 1.5).
-    ior: f32,
-    /// Linear-space emission added after the diffuse term —
-    /// `emissive_factor × KHR_materials_emissive_strength`.
-    emissive: [f32; 3],
-    /// `KHR_materials_unlit` — constant-shade the base colour;
-    /// lighting, shadows, and secondary rays are all skipped.
-    unlit: bool,
-}
-
-impl ShadeMaterial {
-    /// Material used when a primitive has no material reference —
-    /// matches the scanline backend's fallback colour, inert
-    /// (no reflection, no transmission).
-    fn fallback() -> Self {
-        Self {
-            base_color: [0.7, 0.7, 0.75, 1.0],
-            metallic: 0.0,
-            roughness: 1.0,
-            transmission: 0.0,
-            ior: 1.5,
-            emissive: [0.0, 0.0, 0.0],
-            unlit: false,
-        }
-    }
-
-    fn from_material(m: &oxideav_mesh3d::Material) -> Self {
-        Self {
-            base_color: m.base_color,
-            metallic: m.metallic.clamp(0.0, 1.0),
-            roughness: m.roughness.clamp(0.0, 1.0),
-            transmission: m
-                .ext
-                .transmission
-                .as_ref()
-                .map(|t| t.factor.clamp(0.0, 1.0))
-                .unwrap_or(0.0),
-            ior: m.ext.ior.unwrap_or(1.5).max(1.0),
-            emissive: {
-                let strength = m.ext.emissive_strength.unwrap_or(1.0).max(0.0);
-                [
-                    m.emissive_factor[0] * strength,
-                    m.emissive_factor[1] * strength,
-                    m.emissive_factor[2] * strength,
-                ]
-            },
-            unlit: m.ext.unlit,
-        }
-    }
-}
+/// Tile edge (render pixels) of the parallel work unit.
+const TILE: usize = 16;
 
 // ---------------------------------------------------------------------
-// Baked scene.
+// Entry points.
 // ---------------------------------------------------------------------
 
-/// Per-triangle shading payload, parallel to the baked triangle soup.
-#[derive(Debug, Clone, Copy)]
-struct TriShade {
-    /// World-space unit vertex normals (per-vertex when the source
-    /// primitive carried normals, face normal on all three otherwise).
-    normals: [[f32; 3]; 3],
-    /// Index into [`TraceScene::materials`].
-    material: u32,
+/// Render with a throw-away texture cache (built-in raw textures only).
+#[cfg(test)]
+pub(crate) fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
+    render_with_cache(scene, opts, &mut TextureCache::default())
 }
 
-/// World-space triangle soup + BVH + per-triangle shading data.
-struct TraceScene {
-    /// Baked geometry: `Triangles` topology, three vertices per
-    /// triangle (implicit indices), world space.
-    soup: Primitive,
-    /// Parallel per-triangle shading payloads (`soup` triangle `i` ↔
-    /// `shade[i]`).
-    shade: Vec<TriShade>,
-    materials: Vec<ShadeMaterial>,
-    /// `None` when the scene bakes to zero triangles.
-    bvh: Option<Bvh>,
+/// Render to RGBA8, decoding textures through `cache`.
+pub(crate) fn render_with_cache(
+    scene: &Scene3D,
+    opts: &RenderOptions,
+    cache: &mut TextureCache,
+) -> RgbaImage {
+    render_frame(scene, opts, cache).to_rgba8(opts)
 }
 
-impl TraceScene {
-    fn build(scene: &Scene3D) -> Self {
-        let mut soup = Primitive::new(Topology::Triangles);
-        let mut shade: Vec<TriShade> = Vec::new();
-
-        // Materials: slot 0 is the no-material fallback; scene
-        // material `i` maps to slot `i + 1`.
-        let mut materials = Vec::with_capacity(scene.materials.len() + 1);
-        materials.push(ShadeMaterial::fallback());
-        for m in &scene.materials {
-            materials.push(ShadeMaterial::from_material(m));
-        }
-
-        // Iterative pre-order walk: claims each node once at first
-        // arrival so cyclic / shared node graphs terminate, and deep
-        // hierarchies cannot overflow the call stack (see
-        // `camera::walk_scene_preorder`).
-        crate::camera::walk_scene_preorder(scene, |node, world| {
-            if let Some(mesh_id) = node.mesh {
-                if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-                    for prim in &mesh.primitives {
-                        bake_primitive(prim, world, &mut soup, &mut shade);
-                    }
-                }
-            }
-        });
-
-        let bvh = Bvh::build(&soup);
-        Self {
-            soup,
-            shade,
-            materials,
-            bvh,
-        }
-    }
-
-    /// Closest hit against the baked soup in `[0, t_max]`.
-    ///
-    /// Delegates to the SAH [`Bvh`]'s allocation-free ordered
-    /// traversal ([`Bvh::closest_hit`]); the baked soup's implicit
-    /// indices make the reported triangle index the `shade` slot.
-    fn closest_hit(&self, ray: Ray, t_max: f32) -> Option<Hit> {
-        let bvh = self.bvh.as_ref()?;
-        let h = bvh.closest_hit(&self.soup, &PreparedRay::new(ray), &RayQuery::new(t_max))?;
-        Some(Hit {
-            t: h.t,
-            triangle: h.triangle_index,
-            barycentric: h.barycentric,
-        })
-    }
-
-    /// Any-hit (shadow) query in `[0, t_max]` — first intersection
-    /// wins, no ordering ([`Bvh::occluded`]).
-    fn any_hit(&self, ray: Ray, t_max: f32) -> bool {
-        let Some(bvh) = self.bvh.as_ref() else {
-            return false;
-        };
-        bvh.occluded(&self.soup, &PreparedRay::new(ray), &RayQuery::new(t_max))
-    }
-
-    /// Interpolated world-space unit normal at a hit.
-    fn hit_normal(&self, hit: &Hit) -> [f32; 3] {
-        let s = &self.shade[hit.triangle];
-        let [w, u, v] = hit.barycentric;
-        vec3_normalise([
-            w * s.normals[0][0] + u * s.normals[1][0] + v * s.normals[2][0],
-            w * s.normals[0][1] + u * s.normals[1][1] + v * s.normals[2][1],
-            w * s.normals[0][2] + u * s.normals[1][2] + v * s.normals[2][2],
-        ])
-    }
-
-    fn hit_material(&self, hit: &Hit) -> &ShadeMaterial {
-        &self.materials[self.shade[hit.triangle].material as usize]
-    }
+/// Scene-linear output (pre exposure / tone map).
+pub(crate) fn render_hdr_with_cache(
+    scene: &Scene3D,
+    opts: &RenderOptions,
+    cache: &mut TextureCache,
+) -> HdrImage {
+    render_frame(scene, opts, cache).to_hdr()
 }
 
-/// Closest-hit record on the baked soup.
-struct Hit {
-    t: f32,
-    triangle: usize,
-    barycentric: [f32; 3],
-}
-
-fn bake_primitive(
-    prim: &Primitive,
-    world: &[[f32; 4]; 4],
-    soup: &mut Primitive,
-    shade: &mut Vec<TriShade>,
-) {
-    let tris = prim.triangle_indices();
-    if tris.is_empty() {
-        return; // line / point topology or empty primitive
-    }
-    // Material slot: scene material `i` lives at `i + 1`; fallback 0.
-    let material = prim.material.map(|mid| mid.0 + 1).unwrap_or(0);
-    let n_pos = prim.positions.len();
-    // The world matrix is assumed rigid+uniform-scale (the only kind
-    // composed from `Transform::translation/rotation/scale`); its 3x3
-    // upper-left suffices for normal transformation, matching the
-    // scanline backend's convention.
-    for [ia, ib, ic] in tris {
-        let (ia, ib, ic) = (ia as usize, ib as usize, ic as usize);
-        if ia >= n_pos || ib >= n_pos || ic >= n_pos {
-            continue;
-        }
-        let wa = mat4_mul_point(world, prim.positions[ia]);
-        let wb = mat4_mul_point(world, prim.positions[ib]);
-        let wc = mat4_mul_point(world, prim.positions[ic]);
-        let normals = match prim.normals.as_ref() {
-            Some(ns) if ia < ns.len() && ib < ns.len() && ic < ns.len() => [
-                vec3_normalise(mat3_mul_vec3(world, ns[ia])),
-                vec3_normalise(mat3_mul_vec3(world, ns[ib])),
-                vec3_normalise(mat3_mul_vec3(world, ns[ic])),
-            ],
-            _ => {
-                let n = vec3_normalise(vec3_cross(vec3_sub(wb, wa), vec3_sub(wc, wa)));
-                [n, n, n]
-            }
-        };
-        soup.positions.push(wa);
-        soup.positions.push(wb);
-        soup.positions.push(wc);
-        shade.push(TriShade { normals, material });
-    }
-}
-
-// ---------------------------------------------------------------------
-// Public entry point.
-// ---------------------------------------------------------------------
-
-/// Render `scene` into a packed RGBA8 buffer per `opts` by recursive
-/// ray tracing. Honours the same option surface as the scanline
-/// backend: framebuffer size, background, shading mode, projection,
-/// FOV, light, camera override, and SSAA factor.
-///
-/// Rows are traced in parallel across `available_parallelism()`
-/// bands (std scoped threads, no extra dependency). Each band owns a
-/// disjoint slice of the output, so the image is deterministic —
-/// bit-identical across runs and thread counts.
-pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
+fn render_frame(scene: &Scene3D, opts: &RenderOptions, cache: &mut TextureCache) -> Frame {
     let width = opts.width.max(1);
     let height = opts.height.max(1);
     let aa = opts.aa.clamp(1, 8);
-    let render_w = width.saturating_mul(aa).max(1);
-    let render_h = height.saturating_mul(aa).max(1);
+    let rw = width.saturating_mul(aa).max(1);
+    let rh = height.saturating_mul(aa).max(1);
 
-    let bbox = scene_bbox(scene);
-    let camera = Camera::build(render_w, render_h, bbox, opts);
-    let light = build_light(opts.light);
-    let traced = TraceScene::build(scene);
-    let background = opts.background.0;
-    let mode = opts.shading;
+    let prepared = PreparedScene::build(scene, &PrepareOptions::from_render_options(opts), cache);
+    let camera = Camera::resolve(&prepared, opts, rw, rh);
+    let ts = TraceScene::new(prepared);
+    let ambient = if opts.ambient.is_finite() {
+        opts.ambient.max(0.0)
+    } else {
+        0.0
+    };
+    let cutoff = if opts.reflection_roughness_cutoff.is_finite() {
+        opts.reflection_roughness_cutoff.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let lut = srgb_u8_lut();
+    let b = opts.background.0;
+    let ctx = Ctx {
+        ts: &ts,
+        camera,
+        mode: opts.shading,
+        light: build_light(opts.light),
+        ambient,
+        shadows: opts.shadows,
+        max_depth: opts.max_ray_depth.min(MAX_DEPTH_CAP),
+        cutoff,
+        spread: pixel_spread(&camera, rh),
+        bg: [
+            lut[b[0] as usize],
+            lut[b[1] as usize],
+            lut[b[2] as usize],
+            b[3] as f32 / 255.0,
+        ],
+        rw: rw as f32,
+        rh: rh as f32,
+    };
 
-    let (w_us, h_us) = (render_w as usize, render_h as usize);
-    let (wf, hf) = (render_w as f32, render_h as f32);
+    let samples = trace_tiles(rw as usize, rh as usize, |x, y| ctx.pixel(x, y));
+    Frame {
+        out_w: width,
+        out_h: height,
+        aa,
+        samples,
+        background: opts.background.0,
+        display_referred: matches!(
+            opts.shading,
+            ShadingMode::NormalDebug | ShadingMode::DepthDebug
+        ),
+    }
+}
 
-    // Rows are traced in parallel bands over std scoped threads —
-    // every band owns a disjoint `&mut` slice of the output buffer,
-    // so the result is bit-identical to the sequential order
-    // regardless of scheduling (no accumulation, no shared state).
-    // Small renders collapse to one band; no thread is spawned for
-    // the last band (traced on the caller's thread).
-    let mut pixels = vec![0u8; w_us * h_us * 4];
-    let threads = std::thread::available_parallelism()
+/// Evaluate `f(x, y)` for every sample of a `w × h` grid on scoped
+/// worker threads pulling [`TILE`]² tiles from an atomic counter.
+/// Deterministic: each sample depends only on its coordinates.
+fn trace_tiles(w: usize, h: usize, f: impl Fn(usize, usize) -> Sample + Sync) -> Vec<Sample> {
+    let blank = Sample {
+        c: [0.0; 4],
+        covered: false,
+    };
+    let mut out = vec![blank; w * h];
+    let (tx, ty) = (w.div_ceil(TILE), h.div_ceil(TILE));
+    let n_tiles = tx * ty;
+    let run_tile = |t: usize| -> (usize, Vec<Sample>) {
+        let (x0, y0) = ((t % tx) * TILE, (t / tx) * TILE);
+        let (x1, y1) = ((x0 + TILE).min(w), (y0 + TILE).min(h));
+        let mut v = Vec::with_capacity((x1 - x0) * (y1 - y0));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                v.push(f(x, y));
+            }
+        }
+        (t, v)
+    };
+    let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, h_us.max(1));
-    let band_rows = h_us.div_ceil(threads).max(1);
-    let row_bytes = w_us * 4;
-    let trace_band = |band_idx: usize, band: &mut [u8]| {
-        let y0 = band_idx * band_rows;
-        for (row_i, row) in band.chunks_mut(row_bytes).enumerate() {
-            let y = (y0 + row_i) as f32 + 0.5;
-            for (x, px_out) in row.chunks_mut(4).enumerate() {
-                let (origin, dir) = camera.primary_ray(x as f32 + 0.5, y, wf, hf);
-                let ray = Ray::new(origin, dir);
-                let px = trace_pixel(&traced, &camera, &light, ray, mode, background);
-                px_out.copy_from_slice(&px);
-            }
-        }
-    };
-    std::thread::scope(|scope| {
-        let mut bands = pixels.chunks_mut(band_rows * row_bytes).enumerate();
-        let last = bands.next_back();
-        for (band_idx, band) in bands {
-            scope.spawn(move || trace_band(band_idx, band));
-        }
-        if let Some((band_idx, band)) = last {
-            trace_band(band_idx, band);
-        }
-    });
-
-    let img = RgbaImage {
-        width: render_w,
-        height: render_h,
-        stride: w_us * 4,
-        pixels,
-    };
-    if aa <= 1 {
-        img
+        .min(n_tiles)
+        .max(1);
+    let results: Vec<(usize, Vec<Sample>)> = if workers <= 1 {
+        (0..n_tiles).map(run_tile).collect()
     } else {
-        downsample_box(&img, width, height, aa)
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let t = next.fetch_add(1, Ordering::Relaxed);
+                            if t >= n_tiles {
+                                break;
+                            }
+                            done.push(run_tile(t));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+    for (t, v) in results {
+        let (x0, y0) = ((t % tx) * TILE, (t / tx) * TILE);
+        let tw = (x0 + TILE).min(w) - x0;
+        for (i, s) in v.into_iter().enumerate() {
+            out[(y0 + i / tw) * w + x0 + i % tw] = s;
+        }
     }
+    out
 }
 
-/// Shade one primary ray under the selected [`ShadingMode`].
-fn trace_pixel(
-    traced: &TraceScene,
-    camera: &Camera,
-    light: &DirLight,
-    ray: Ray,
+// ---------------------------------------------------------------------
+// Per-render context.
+// ---------------------------------------------------------------------
+
+struct Ctx<'a> {
+    ts: &'a TraceScene,
+    camera: Camera,
     mode: ShadingMode,
-    background: [u8; 4],
-) -> [u8; 4] {
-    let Some(hit) = traced.closest_hit(ray, f32::INFINITY) else {
-        return background;
-    };
-    match mode {
-        ShadingMode::Flat => {
-            // Parity with the scanline backend: unlit constant colour.
-            linear_rgba_to_srgb_u8(traced.hit_material(&hit).base_color)
-        }
-        ShadingMode::Wireframe => {
-            // A rasteriser draws edges; a ray tracer detects them —
-            // paint the pixel when the hit sits within an edge band
-            // in barycentric space, else show through to whatever is
-            // behind (background: closest-hit only, single layer).
-            let min_bary = hit
-                .barycentric
-                .iter()
-                .fold(f32::INFINITY, |acc, &b| acc.min(b));
-            if min_bary <= WIREFRAME_EDGE_WIDTH {
-                linear_rgba_to_srgb_u8(traced.hit_material(&hit).base_color)
-            } else {
-                background
-            }
-        }
-        ShadingMode::Gouraud => {
-            // Per-vertex lighting interpolated across the face —
-            // matches the rasteriser's Gouraud definition.
-            let s = &traced.shade[hit.triangle];
-            let base = traced.hit_material(&hit).base_color;
-            let [w, u, v] = hit.barycentric;
-            let ca = shade_pixel(base, s.normals[0], light);
-            let cb = shade_pixel(base, s.normals[1], light);
-            let cc = shade_pixel(base, s.normals[2], light);
-            let mixed = [
-                w * ca[0] + u * cb[0] + v * cc[0],
-                w * ca[1] + u * cb[1] + v * cc[1],
-                w * ca[2] + u * cb[2] + v * cc[2],
-                w * ca[3] + u * cb[3] + v * cc[3],
-            ];
-            linear_rgba_to_srgb_u8(mixed)
-        }
-        ShadingMode::Phong | ShadingMode::Pbr => {
-            let colour = trace_whitted(traced, light, ray, &hit, 0);
-            linear_rgba_to_srgb_u8(colour)
-        }
-        ShadingMode::NormalDebug => {
-            let n = traced.hit_normal(&hit);
-            [
-                crate::scanline::normal_to_byte(n[0]),
-                crate::scanline::normal_to_byte(n[1]),
-                crate::scanline::normal_to_byte(n[2]),
-                255,
-            ]
-        }
-        ShadingMode::DepthDebug => {
-            let p = ray.point_at(hit.t);
-            let z = camera.ndc_z(camera.view_depth(p));
-            let g = crate::scanline::depth_to_byte(z);
-            [g, g, g, 255]
-        }
-    }
+    /// Legacy-mode directional light.
+    light: DirLight,
+    ambient: f32,
+    shadows: bool,
+    max_depth: u32,
+    cutoff: f32,
+    /// Camera per-pixel spread angle (ray cones).
+    spread: f32,
+    /// Linear background (camera-ray misses through `BLEND` layers).
+    bg: [f32; 4],
+    rw: f32,
+    rh: f32,
 }
 
-/// Whitted shading at a hit: Lambert + ambient with a shadow ray,
-/// plus recursive reflection (metallic) and refraction
-/// (transmission) rays blended by a Schlick Fresnel weight.
-///
-/// Returns a linear-space RGBA colour.
-fn trace_whitted(
-    traced: &TraceScene,
-    light: &DirLight,
-    ray: Ray,
-    hit: &Hit,
+/// Texture footprint a ray carries.
+#[derive(Debug, Clone, Copy)]
+enum Footprint {
+    /// Neighbouring camera rays (valid while the path is straight).
+    Diff {
+        dx: ([f32; 3], [f32; 3]),
+        dy: ([f32; 3], [f32; 3]),
+    },
+    /// Ray cone: width at the origin, spread per unit distance.
+    Cone { width: f32, spread: f32 },
+}
+
+/// Recursion state of a `Pbr` ray.
+#[derive(Debug, Clone, Copy)]
+struct RayState {
+    /// Reflection / refraction bounces so far.
     depth: u32,
-) -> [f32; 4] {
-    let material = *traced.hit_material(hit);
-    // `KHR_materials_unlit`: constant shade from the base colour
-    // alone — no lighting, no shadow ray, no secondary rays (all
-    // lighting-dependent inputs are ignored per the extension).
-    if material.unlit {
-        return material.base_color;
-    }
-    // Orient the interpolated normal against the incident ray so
-    // lighting and secondary-ray geometry stay on the struck side.
-    // The authored (or face) normal is the shading truth — geometric
-    // winding is deliberately NOT consulted here, matching the
-    // scanline backend, which shades with the interpolated normal
-    // regardless of winding. `entering` doubles as the
-    // inside/outside signal for the refraction index ratio.
-    let raw_normal = traced.hit_normal(hit);
-    let entering = vec3_dot(ray.direction, raw_normal) < 0.0;
-    let normal = if entering {
-        raw_normal
-    } else {
-        vec3_scale(raw_normal, -1.0)
-    };
-    let point = ray.point_at(hit.t);
+    /// See-through continuations so far.
+    layers: u32,
+    /// Still a camera ray (only `BLEND` continuations so far): misses
+    /// see the background canvas instead of the environment.
+    camera: bool,
+    /// Absorption coefficient of the volume the ray travels in.
+    inside: Option<[f32; 3]>,
+    /// Global triangle the ray leaves.
+    skip: Option<u32>,
+}
 
-    // Direct lighting with a shadow ray toward the light. An occluded
-    // surface keeps only the ambient term.
-    let shadow_origin = vec3_add(point, vec3_scale(normal, RAY_EPSILON));
-    let mut lit = if traced.any_hit(Ray::new(shadow_origin, light.direction), f32::INFINITY) {
-        let a = material.base_color;
-        [a[0] * AMBIENT, a[1] * AMBIENT, a[2] * AMBIENT, a[3]]
-    } else {
-        shade_pixel(material.base_color, normal, light)
-    };
-    // Additive emission (`emissive_factor × emissive_strength`) —
-    // self-illumination on top of the diffuse term, unaffected by
-    // shadowing. The sRGB encode clamps; >1 strengths saturate
-    // toward white exactly as an SDR surface should.
-    for (l, e) in lit.iter_mut().zip(material.emissive.iter()) {
-        *l += e;
-    }
-
-    if depth >= MAX_DEPTH {
-        return lit;
-    }
-
-    let in_dir = vec3_normalise(ray.direction);
-    let cos_in = (-vec3_dot(in_dir, normal)).clamp(0.0, 1.0);
-
-    // Reflection — mirror term weighted by metallic, faded by
-    // roughness (a single Whitted ray cannot represent a glossy
-    // lobe), boosted at grazing angles by Schlick's approximation
-    // with F0 blended toward the metal's own reflectance.
-    let mut out = lit;
-    let gloss = material.metallic * (1.0 - material.roughness);
-    if gloss > SECONDARY_RAY_THRESHOLD {
-        let f0 = 0.04 + 0.96 * material.metallic;
-        let kr = (f0 + (1.0 - f0) * (1.0 - cos_in).powi(5)).clamp(0.0, 1.0) * gloss;
-        let refl_dir = reflect(in_dir, normal);
-        let refl_origin = vec3_add(point, vec3_scale(normal, RAY_EPSILON));
-        let refl_ray = Ray::new(refl_origin, refl_dir);
-        let refl_colour = match traced.closest_hit(refl_ray, f32::INFINITY) {
-            Some(refl_hit) => trace_whitted(traced, light, refl_ray, &refl_hit, depth + 1),
-            // A reflection ray that escapes the scene contributes
-            // nothing (the framebuffer background is a canvas
-            // colour, not an environment).
-            None => [0.0, 0.0, 0.0, 1.0],
+impl Ctx<'_> {
+    fn pixel(&self, x: usize, y: usize) -> Sample {
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        let (o, d) = self.camera.primary_ray(px, py, self.rw, self.rh);
+        let c = match self.mode {
+            ShadingMode::Pbr => {
+                let fp = Footprint::Diff {
+                    dx: self.camera.primary_ray(px + 1.0, py, self.rw, self.rh),
+                    dy: self.camera.primary_ray(px, py + 1.0, self.rw, self.rh),
+                };
+                let st = RayState {
+                    depth: 0,
+                    layers: 0,
+                    camera: true,
+                    inside: None,
+                    skip: None,
+                };
+                self.radiance(o, d, fp, st)
+            }
+            _ => self.legacy(o, d),
         };
-        // Metals tint their reflection by the base colour.
-        let tint = material.base_color;
-        for i in 0..3 {
-            out[i] = out[i] * (1.0 - kr) + refl_colour[i] * tint[i] * kr;
+        match c {
+            Some(c) => Sample { c, covered: true },
+            None => Sample {
+                c: [0.0; 4],
+                covered: false,
+            },
         }
     }
 
-    // Refraction — transmission ray bent by Snell's law; total
-    // internal reflection folds into the reflection term.
-    if material.transmission > SECONDARY_RAY_THRESHOLD {
-        let kt = material.transmission;
-        let eta = if entering {
-            1.0 / material.ior
-        } else {
-            material.ior
-        };
-        match refract(in_dir, normal, eta) {
-            Some(refr_dir) => {
-                // Push through the surface, against the normal.
-                let refr_origin = vec3_add(point, vec3_scale(normal, -RAY_EPSILON));
-                let refr_ray = Ray::new(refr_origin, refr_dir);
-                let refr_colour = match traced.closest_hit(refr_ray, f32::INFINITY) {
-                    Some(refr_hit) => trace_whitted(traced, light, refr_ray, &refr_hit, depth + 1),
-                    None => [0.0, 0.0, 0.0, 0.0],
-                };
-                let tint = material.base_color;
-                for i in 0..3 {
-                    out[i] = out[i] * (1.0 - kt) + refr_colour[i] * tint[i] * kt;
+    // -----------------------------------------------------------------
+    // Legacy modes.
+    // -----------------------------------------------------------------
+
+    fn legacy(&self, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+        let hit = self.ts.closest_hit(o, d, 0.0, f32::INFINITY)?;
+        let (item, mat) = self.ts.item(&hit);
+        let base = 3 * hit.tri as usize;
+        let b = hit.barycentric;
+        Some(match self.mode {
+            ShadingMode::Flat => mat.base_color,
+            ShadingMode::Wireframe => {
+                // A rasteriser draws edges; a ray tracer detects them —
+                // paint when the hit lies in a barycentric edge band,
+                // else show the background (closest hit only).
+                let m = b.iter().fold(f32::INFINITY, |a, &v| a.min(v));
+                if m > WIREFRAME_EDGE_WIDTH {
+                    return None;
                 }
+                mat.base_color
             }
-            None => {
-                // Total internal reflection: send the energy along
-                // the mirror direction instead.
-                let refl_dir = reflect(in_dir, normal);
-                let refl_origin = vec3_add(point, vec3_scale(normal, RAY_EPSILON));
-                let refl_ray = Ray::new(refl_origin, refl_dir);
-                if let Some(refl_hit) = traced.closest_hit(refl_ray, f32::INFINITY) {
-                    let refl_colour = trace_whitted(traced, light, refl_ray, &refl_hit, depth + 1);
-                    for i in 0..3 {
-                        out[i] = out[i] * (1.0 - kt) + refl_colour[i] * kt;
+            ShadingMode::Gouraud => {
+                let n = &item.normals;
+                let ca = shade_pixel(mat.base_color, n[base], &self.light);
+                let cb = shade_pixel(mat.base_color, n[base + 1], &self.light);
+                let cc = shade_pixel(mat.base_color, n[base + 2], &self.light);
+                let mut o = [0.0; 4];
+                for k in 0..4 {
+                    o[k] = ca[k] * b[0] + cb[k] * b[1] + cc[k] * b[2];
+                }
+                o
+            }
+            ShadingMode::NormalDebug => {
+                let n = vec3_normalise(interp3(&item.normals, base, b));
+                let lut = srgb_u8_lut();
+                [
+                    lut[normal_to_byte(n[0]) as usize],
+                    lut[normal_to_byte(n[1]) as usize],
+                    lut[normal_to_byte(n[2]) as usize],
+                    1.0,
+                ]
+            }
+            ShadingMode::DepthDebug => {
+                let p = interp3(&item.positions, base, b);
+                let z = self.camera.ndc_z(self.camera.view_depth(p));
+                let g = srgb_u8_lut()[depth_to_byte(z) as usize];
+                [g, g, g, 1.0]
+            }
+            _ => self.whitted(d, &hit, 0),
+        })
+    }
+
+    /// Historical `Phong` Whitted shading: Lambert + ambient with a
+    /// shadow ray, recursive mirror (metallic) and refraction
+    /// (transmission) rays blended by a Schlick weight.
+    fn whitted(&self, d: [f32; 3], hit: &TraceHit, depth: u32) -> [f32; 4] {
+        let (item, mat) = self.ts.item(hit);
+        if mat.unlit {
+            return mat.base_color;
+        }
+        let base = 3 * hit.tri as usize;
+        let raw = vec3_normalise(interp3(&item.normals, base, hit.barycentric));
+        // Orient the interpolated normal against the incident ray;
+        // `entering` doubles as the inside/outside signal for the
+        // refraction index ratio.
+        let entering = vec3_dot(d, raw) < 0.0;
+        let n = if entering { raw } else { vec3_scale(raw, -1.0) };
+        let p = interp3(&item.positions, base, hit.barycentric);
+        let skip = hit.global;
+        let not_self = |h: &TraceHit| h.global != skip;
+
+        let so = offset_ray_origin(p, n);
+        let shadowed =
+            self.ts
+                .occluded_filtered(so, self.light.direction, 0.0, f32::INFINITY, not_self);
+        let a = mat.base_color;
+        let mut out = if shadowed {
+            [a[0] * AMBIENT, a[1] * AMBIENT, a[2] * AMBIENT, a[3]]
+        } else {
+            shade_pixel(a, n, &self.light)
+        };
+        for (o, e) in out.iter_mut().zip(mat.emissive) {
+            *o += e;
+        }
+        if depth >= self.max_depth {
+            return out;
+        }
+        let cos_in = (-vec3_dot(d, n)).clamp(0.0, 1.0);
+        let trace = |o: [f32; 3], dir: [f32; 3]| -> Option<[f32; 4]> {
+            let h = self
+                .ts
+                .closest_hit_filtered(o, dir, 0.0, f32::INFINITY, not_self)?;
+            Some(self.whitted(dir, &h, depth + 1))
+        };
+
+        let gloss = mat.metallic * (1.0 - mat.roughness);
+        if gloss > SECONDARY_RAY_THRESHOLD {
+            let f0 = 0.04 + 0.96 * mat.metallic;
+            let kr = schlick(f0, cos_in).clamp(0.0, 1.0) * gloss;
+            // Escaping reflection rays contribute black (the canvas
+            // colour is not an environment).
+            let rc = trace(so, reflect(d, n)).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            for k in 0..3 {
+                out[k] = out[k] * (1.0 - kr) + rc[k] * a[k] * kr;
+            }
+        }
+        let kt = mat
+            .ext
+            .transmission
+            .map(|t| t.factor.clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        if kt > SECONDARY_RAY_THRESHOLD {
+            let eta = if entering { 1.0 / mat.ior } else { mat.ior };
+            match refract(d, n, eta) {
+                Some(t) => {
+                    let ro = offset_ray_origin(p, vec3_scale(n, -1.0));
+                    let tc = trace(ro, t).unwrap_or([0.0; 4]);
+                    for k in 0..3 {
+                        out[k] = out[k] * (1.0 - kt) + tc[k] * a[k] * kt;
+                    }
+                }
+                None => {
+                    // Total internal reflection: the energy goes along
+                    // the mirror direction instead.
+                    if let Some(rc) = trace(so, reflect(d, n)) {
+                        for k in 0..3 {
+                            out[k] = out[k] * (1.0 - kt) + rc[k] * kt;
+                        }
                     }
                 }
             }
         }
+        out
     }
 
-    out
-}
+    // -----------------------------------------------------------------
+    // Pbr.
+    // -----------------------------------------------------------------
 
-/// Mirror `d` about unit normal `n` (both unit; `d` points into the
-/// surface): `d - 2 (d·n) n`.
-fn reflect(d: [f32; 3], n: [f32; 3]) -> [f32; 3] {
-    vec3_sub(d, vec3_scale(n, 2.0 * vec3_dot(d, n)))
-}
-
-/// Refract unit direction `d` through unit normal `n` (pointing
-/// toward the incident side) with relative index `eta` (incident /
-/// transmitted). Returns `None` on total internal reflection.
-///
-/// Vector Snell form: with `cos_i = -d·n`,
-/// `sin²_t = eta² (1 - cos²_i)`; TIR when `sin²_t > 1`; otherwise
-/// `t = eta d + (eta cos_i - cos_t) n`.
-fn refract(d: [f32; 3], n: [f32; 3], eta: f32) -> Option<[f32; 3]> {
-    let cos_i = (-vec3_dot(d, n)).clamp(-1.0, 1.0);
-    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
-    if sin2_t > 1.0 {
-        return None;
+    /// Radiance (+ coverage alpha) arriving along `o + t·d`; `None`
+    /// when the ray escapes.
+    fn radiance(&self, o: [f32; 3], d: [f32; 3], fp: Footprint, st: RayState) -> Option<[f32; 4]> {
+        let ts = self.ts;
+        let cull = st.inside.is_none();
+        let hit = ts.closest_hit_filtered(o, d, 0.0, f32::INFINITY, |h| {
+            if Some(h.global) == st.skip {
+                return false;
+            }
+            let (_, mat) = ts.item(h);
+            if cull && !h.front_face && !mat.double_sided {
+                return false;
+            }
+            !ts.masked_out(h)
+        })?;
+        let mut c = self.shade(d, &hit, fp, st);
+        if let Some(sigma) = st.inside {
+            for k in 0..3 {
+                c[k] *= (-sigma[k] * hit.t).exp();
+            }
+        }
+        Some(c)
     }
-    let cos_t = (1.0 - sin2_t).sqrt();
-    Some(vec3_normalise(vec3_add(
-        vec3_scale(d, eta),
-        vec3_scale(n, eta * cos_i - cos_t),
-    )))
+
+    /// What a ray of state `st` sees when it escapes.
+    fn miss(&self, st: &RayState) -> [f32; 4] {
+        if st.camera {
+            self.bg
+        } else {
+            [self.ambient, self.ambient, self.ambient, 1.0]
+        }
+    }
+
+    /// Trace a secondary ray, falling back to the environment.
+    fn secondary(&self, o: [f32; 3], d: [f32; 3], fp: Footprint, st: RayState) -> [f32; 3] {
+        let c = self
+            .radiance(o, d, fp, st)
+            .unwrap_or_else(|| self.miss(&st));
+        [c[0], c[1], c[2]]
+    }
+
+    fn shade(&self, d: [f32; 3], hit: &TraceHit, fp: Footprint, st: RayState) -> [f32; 4] {
+        let ts = self.ts;
+        let surf = ts.surface(hit);
+        let (lod, width) = match fp {
+            Footprint::Diff { dx, dy } => ts
+                .barycentric_differentials(hit, dx, dy)
+                .unwrap_or((TexLod::Base, 0.0)),
+            Footprint::Cone { width, spread } => {
+                let w = (width + spread * hit.t).max(0.0);
+                (TexLod::Cone { width: w, dir: d }, w)
+            }
+        };
+        let m = ts.material_oriented(hit, &surf, lod, !hit.front_face);
+        let p = surf.position;
+        let ng = if hit.front_face {
+            surf.geometric_normal
+        } else {
+            vec3_scale(surf.geometric_normal, -1.0)
+        };
+        let n = m.normal;
+        let v = vec3_scale(d, -1.0);
+        let skip = Some(hit.global);
+        let bounce = Footprint::Cone {
+            width,
+            spread: self.spread,
+        };
+        let can_bounce = st.depth < self.max_depth;
+        let f0_d = {
+            let r = (m.ior - 1.0) / (m.ior + 1.0);
+            r * r
+        };
+
+        // Leaving a volume through its boundary: Fresnel split between
+        // the internally reflected and the refracted (outgoing) ray.
+        if st.inside.is_some() && !hit.front_face && m.transmission > 0.0 && m.thickness > 0.0 {
+            let tint_st = |inside| RayState {
+                depth: st.depth + 1,
+                layers: st.layers,
+                camera: false,
+                inside,
+                skip,
+            };
+            if !can_bounce {
+                let e = self.miss(&tint_st(None));
+                return [e[0], e[1], e[2], 1.0];
+            }
+            let cos_i = vec3_dot(v, n).clamp(0.0, 1.0);
+            let internal = || {
+                self.secondary(
+                    offset_ray_origin(p, ng),
+                    reflect(d, n),
+                    bounce,
+                    tint_st(st.inside),
+                )
+            };
+            return match refract(d, n, m.ior) {
+                Some(t) => {
+                    let sin2_t = m.ior * m.ior * (1.0 - cos_i * cos_i);
+                    let f = schlick(f0_d, (1.0 - sin2_t).max(0.0).sqrt());
+                    let out = self.secondary(
+                        offset_ray_origin(p, vec3_scale(ng, -1.0)),
+                        t,
+                        bounce,
+                        tint_st(None),
+                    );
+                    let inn = internal();
+                    [
+                        f * inn[0] + (1.0 - f) * out[0],
+                        f * inn[1] + (1.0 - f) * out[1],
+                        f * inn[2] + (1.0 - f) * out[2],
+                        1.0,
+                    ]
+                }
+                None => {
+                    let inn = internal();
+                    [inn[0], inn[1], inn[2], 1.0]
+                }
+            };
+        }
+
+        let col = m.base_color;
+        let alpha = match m.alpha_mode {
+            AlphaMode::Blend => col[3].clamp(0.0, 1.0),
+            _ => 1.0,
+        };
+        let mut out = [0.0f32; 3];
+        if m.unlit {
+            out = [col[0], col[1], col[2]];
+        } else {
+            let mut params = BrdfParams::metallic_roughness(
+                [col[0], col[1], col[2]],
+                m.metallic,
+                m.roughness,
+                f0_d,
+            );
+            let kt = if can_bounce && m.transmission > 0.0 {
+                m.transmission
+            } else {
+                0.0
+            };
+            for c in params.c_diff.iter_mut() {
+                *c *= 1.0 - kt;
+            }
+            let g = if can_bounce && m.roughness < self.cutoff {
+                let x = 1.0 - m.roughness / self.cutoff;
+                x * x
+            } else {
+                0.0
+            };
+            for (k, o) in out.iter_mut().enumerate() {
+                *o = m.emissive[k]
+                    + self.ambient * m.occlusion * (params.c_diff[k] + (1.0 - g) * params.f0[k]);
+            }
+            let direct = ts.direct_light(p, n, ng, v, &params, self.shadows, skip);
+            for k in 0..3 {
+                out[k] += direct[k];
+            }
+            let next = |inside| RayState {
+                depth: st.depth + 1,
+                layers: st.layers,
+                camera: false,
+                inside,
+                skip,
+            };
+            if g > 0.0 {
+                let n_dot_v = vec3_dot(n, v).clamp(0.0, 1.0);
+                let f = f_schlick(params.f0, n_dot_v);
+                let mut r = reflect(d, n);
+                if vec3_dot(r, ng) <= 0.0 {
+                    // Normal-mapped normal sending the mirror ray under
+                    // the surface: reflect about the geometric normal.
+                    r = reflect(d, ng);
+                }
+                let l = self.secondary(offset_ray_origin(p, ng), r, bounce, next(st.inside));
+                for k in 0..3 {
+                    out[k] += g * f[k] * l[k];
+                }
+            }
+            if kt > 0.0 {
+                let share = kt * (1.0 - m.metallic);
+                let cos_i = vec3_dot(v, n).clamp(0.0, 1.0);
+                let through = offset_ray_origin(p, vec3_scale(ng, -1.0));
+                let (f, l) = if m.thickness > 0.0 && hit.front_face {
+                    // Entering a volume: Snell bend, absorption inside.
+                    let sigma = attenuation_sigma(m.attenuation_color, m.attenuation_distance);
+                    match refract(d, n, 1.0 / m.ior) {
+                        Some(t) => (
+                            schlick(f0_d, cos_i),
+                            self.secondary(through, t, bounce, next(Some(sigma))),
+                        ),
+                        None => (1.0, [0.0; 3]),
+                    }
+                } else {
+                    // Thin wall: straight through, footprint unchanged.
+                    let st2 = RayState {
+                        layers: st.layers + 1,
+                        ..next(st.inside)
+                    };
+                    (schlick(f0_d, cos_i), self.secondary(through, d, fp, st2))
+                };
+                for k in 0..3 {
+                    out[k] += share * (1.0 - f) * col[k] * l[k];
+                }
+            }
+        }
+
+        if alpha >= 1.0 {
+            return [out[0], out[1], out[2], 1.0];
+        }
+        // BLEND: continue the ray behind the surface and composite.
+        let dst = if st.layers < MAX_LAYERS {
+            let st2 = RayState {
+                layers: st.layers + 1,
+                skip,
+                ..st
+            };
+            self.radiance(offset_ray_origin(p, vec3_scale(ng, -1.0)), d, fp, st2)
+                .unwrap_or_else(|| self.miss(&st))
+        } else {
+            self.miss(&st)
+        };
+        over([out[0], out[1], out[2], alpha], dst)
+    }
+}
+
+/// Beer–Lambert absorption coefficient of `KHR_materials_volume`:
+/// `σ = −ln(attenuationColor) / attenuationDistance` (`0` when the
+/// distance is infinite).
+fn attenuation_sigma(color: [f32; 3], distance: f32) -> [f32; 3] {
+    if !(distance.is_finite() && distance > 0.0) {
+        return [0.0; 3];
+    }
+    color.map(|c| -c.clamp(1.0e-6, 1.0).ln() / distance)
+}
+
+/// Straight-alpha Porter–Duff *over* in linear space.
+fn over(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
+    let a = src[3].clamp(0.0, 1.0);
+    let ad = dst[3].clamp(0.0, 1.0);
+    let ao = a + ad * (1.0 - a);
+    if ao <= 0.0 {
+        return [0.0; 4];
+    }
+    let mut c = [0.0; 4];
+    for k in 0..3 {
+        c[k] = (src[k] * a + dst[k] * ad * (1.0 - a)) / ao;
+    }
+    c[3] = ao;
+    c
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::vec3_normalise;
     use crate::options::BackgroundColor;
-    use oxideav_mesh3d::{Indices, Material, MaterialId, Mesh, MeshId, Node, NodeId, Scene3D};
+    use crate::shade::linear_rgba_to_srgb_u8;
+    use oxideav_mesh3d::{
+        Indices, Material, MaterialId, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology,
+    };
 
     const WHITE_BG: BackgroundColor = BackgroundColor([255, 255, 255, 255]);
 

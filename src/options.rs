@@ -19,14 +19,21 @@ pub enum RenderBackend {
     /// raytraced shadows.
     Scanline,
     /// Whitted recursive ray tracer — same shading-mode surface as
-    /// `Scanline`, plus (in `Phong` mode) raytraced hard shadows and
-    /// recursive reflection / refraction driven by material
-    /// metallic / roughness / transmission / IOR. Line and point
+    /// `Scanline`, rendering the same prepared scene through the same
+    /// camera. `Phong` adds raytraced hard shadows and recursive
+    /// reflection / refraction driven by material metallic /
+    /// roughness / transmission / IOR; `Pbr` evaluates the scanline
+    /// glTF model per hit and adds ray-traced shadows for every light
+    /// type ([`RenderOptions::shadows`]), Fresnel-weighted mirror
+    /// reflection below [`RenderOptions::reflection_roughness_cutoff`],
+    /// refraction through `KHR_materials_transmission` / `_volume`,
+    /// `MASK` as an any-hit filter and `BLEND` by continued rays, up
+    /// to [`RenderOptions::max_ray_depth`] bounces. Line and point
     /// topologies have no surface area and are invisible to rays.
     Raycast,
 }
 
-/// Shading model selector consumed by the scanline backend.
+/// Shading model selector consumed by every backend.
 ///
 /// Per-pixel shading inputs (material colour, normals) come from
 /// [`oxideav_mesh3d::Scene3D`]. The choice of model is decoupled from
@@ -60,8 +67,10 @@ pub enum ShadingMode {
     /// [`RenderOptions::light`]), alpha modes, back-face culling, and
     /// optional shadow maps ([`RenderOptions::shadows`]).
     ///
-    /// Backends without a native PBR path (today: `Raycast`) render
-    /// this mode like [`ShadingMode::Phong`].
+    /// The `Raycast` backend evaluates the same model per ray hit and
+    /// adds ray-traced hard shadows (instead of shadow maps), mirror
+    /// reflections, refraction (`KHR_materials_transmission` /
+    /// `_volume`) and see-through `BLEND`.
     Pbr,
 }
 
@@ -209,8 +218,9 @@ pub struct RenderOptions {
     /// finite and `>= 0`. Default `0.2`. The legacy Gouraud / Phong
     /// modes keep their fixed 0.2 ambient term.
     pub ambient: f32,
-    /// Shadow maps for directional and spot lights in
-    /// [`ShadingMode::Pbr`] (Williams 1978, filtered with PCF).
+    /// Shadows in [`ShadingMode::Pbr`]: shadow maps for directional and
+    /// spot lights on `Scanline` (Williams 1978, filtered with PCF);
+    /// ray-traced hard shadows for every light type on `Raycast`.
     /// Default `false`.
     pub shadows: bool,
     /// Shadow-map resolution (texels per side), `16..=8192`. Default
@@ -220,6 +230,17 @@ pub struct RenderOptions {
     /// `Scene3D::material_variants`). `None` (default) uses each
     /// primitive's base material.
     pub material_variant: Option<usize>,
+    /// Ray backends: maximum number of reflection / refraction bounces
+    /// per camera ray (`0` = no secondary rays; `BLEND` see-through
+    /// continuations are not counted). Clamped to `0..=16`. Default
+    /// `4`.
+    pub max_ray_depth: u32,
+    /// `Raycast` [`ShadingMode::Pbr`]: perceptual roughness at or above
+    /// which no mirror-reflection ray is traced (the environment's
+    /// uniform ambient stands in for the glossy lobe). Below it the
+    /// traced reflection fades in as `(1 − roughness / cutoff)²`. `0`
+    /// disables reflection rays. In `[0, 1]`; default `0.5`.
+    pub reflection_roughness_cutoff: f32,
 }
 
 impl Default for RenderOptions {
@@ -245,6 +266,8 @@ impl Default for RenderOptions {
             shadows: false,
             shadow_map_size: 1024,
             material_variant: None,
+            max_ray_depth: 4,
+            reflection_roughness_cutoff: 0.5,
         }
     }
 }
@@ -272,7 +295,8 @@ impl RenderOptions {
     ///   is `> 0`.
     /// * `camera_target_offset` is finite.
     /// * `exposure` and `ambient` are finite and `>= 0.0`; `time` (if
-    ///   set) is finite; `shadow_map_size` is within `16..=8192`.
+    ///   set) is finite; `shadow_map_size` is within `16..=8192`;
+    ///   `reflection_roughness_cutoff` is within `[0, 1]`.
     ///
     /// `validate` is **not** called automatically by [`crate::Renderer::render`]
     /// — backends today silently clamp instead — so a caller that wants
@@ -347,6 +371,12 @@ impl RenderOptions {
                 )));
             }
         }
+        if !(0.0..=1.0).contains(&self.reflection_roughness_cutoff) {
+            return Err(Error::InvalidOptions(format!(
+                "reflection_roughness_cutoff must be in [0, 1], got {}",
+                self.reflection_roughness_cutoff
+            )));
+        }
         if !(16..=8192).contains(&self.shadow_map_size) {
             return Err(Error::InvalidOptions(format!(
                 "shadow_map_size must be in 16..=8192, got {}",
@@ -418,6 +448,10 @@ mod tests {
             },
             RenderOptions {
                 shadow_map_size: 4,
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                reflection_roughness_cutoff: f32::NAN,
                 ..RenderOptions::default()
             },
         ] {

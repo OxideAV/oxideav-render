@@ -14,8 +14,9 @@
 //! light with ambient. Phase C bridged the renderer into
 //! `oxideav-pipeline` via `RenderSource`. Phase D fills `Raycast`
 //! in with a BVH-accelerated Whitted recursive ray tracer covering
-//! the same option surface plus raytraced hard shadows and recursive
-//! reflection / refraction. The path-tracer backend lands in Phase E.
+//! the same option surface — including the full glTF `Pbr` model —
+//! plus ray-traced hard shadows, recursive reflection / refraction
+//! and see-through alpha blending. The path-tracer backend lands in Phase E.
 //!
 //! All backends sit on shared, public, backend-agnostic layers:
 //! [`prepare`] (scene → world-space render list with animation,
@@ -146,9 +147,9 @@ pub trait Renderer: Send {
         Ok(HdrImage::from_rgba8(&self.render(scene, opts)?))
     }
     /// Install the image decoder used for scene textures. Backends
-    /// that sample textures replace their texture cache (dropping
-    /// previously decoded images); backends that do not sample
-    /// textures (today: `Raycast`) ignore it — the default.
+    /// that sample textures (`Scanline`, `Raycast`) replace their
+    /// texture cache (dropping previously decoded images); backends
+    /// that do not sample textures ignore it — the default.
     fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
         let _ = resolver;
     }
@@ -227,26 +228,41 @@ impl Renderer for ScanlineRenderer {
     }
 }
 
-/// Whitted recursive ray tracer — closest-hit shading through a
-/// BVH-accelerated world-space triangle soup, with raytraced hard
-/// shadows and recursive reflection / refraction in
-/// [`ShadingMode::Phong`]. See [`raycast`](crate::options::RenderBackend::Raycast)
-/// for the capability envelope.
+/// Whitted recursive ray tracer over the shared [`prepare`] /
+/// [`trace`] layers — the scanline backend's shading modes plus, in
+/// [`ShadingMode::Pbr`], ray-traced hard shadows for every light type,
+/// mirror reflection, refraction (`KHR_materials_transmission` /
+/// `_volume` / `_ior`) and see-through `BLEND`. See
+/// [`RenderBackend::Raycast`] for the capability envelope.
 ///
 /// Constructed via [`make_renderer`] (recommended) or directly. The
-/// scene is baked (flattened + BVH-built) once per `render` call, so
-/// re-rendering the same scene re-bakes; per-frame scene mutation is
-/// therefore free of stale-acceleration hazards.
+/// scene is prepared and its BVH built once per `render` call (so
+/// animated / mutated scenes never trace stale acceleration data);
+/// decoded textures persist in the renderer's [`TextureCache`].
 #[derive(Debug, Default)]
 pub struct RaycastRenderer {
-    _priv: (),
+    cache: TextureCache,
 }
 
 impl RaycastRenderer {
-    /// Construct a fresh raycast renderer (state-free — the trace
-    /// scene and framebuffer are per-`render` allocations).
+    /// Construct a raycast renderer with no image decoder (the trace
+    /// scene and framebuffer are per-`render` allocations; decoded
+    /// textures persist in the renderer's [`TextureCache`]).
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self::default()
+    }
+
+    /// Construct a raycast renderer decoding textures through
+    /// `resolver`.
+    pub fn with_texture_resolver(resolver: std::sync::Arc<dyn TextureResolver>) -> Self {
+        Self {
+            cache: TextureCache::new(resolver),
+        }
+    }
+
+    /// The renderer's texture cache.
+    pub fn texture_cache_mut(&mut self) -> &mut TextureCache {
+        &mut self.cache
     }
 }
 
@@ -256,7 +272,19 @@ impl Renderer for RaycastRenderer {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
-        Ok(raycast::render_scene(scene, opts))
+        Ok(raycast::render_with_cache(scene, opts, &mut self.cache))
+    }
+
+    fn render_hdr(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<HdrImage> {
+        Ok(raycast::render_hdr_with_cache(scene, opts, &mut self.cache))
+    }
+
+    fn set_texture_resolver(&mut self, resolver: std::sync::Arc<dyn TextureResolver>) {
+        self.cache.set_resolver(resolver);
     }
 }
 
