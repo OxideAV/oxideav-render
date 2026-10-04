@@ -34,6 +34,13 @@ pub enum Error {
     /// or a job-graph validator without re-deriving the constraint.
     #[error("invalid render options: {0}")]
     InvalidOptions(String),
+
+    /// A backend failed at runtime for a reason outside the scene and
+    /// the options — e.g. a GPU backend found no usable adapter, the
+    /// device was lost, or a readback failed. The wrapped string is a
+    /// human-readable description from the backend.
+    #[error("renderer backend failure: {0}")]
+    Backend(String),
 }
 
 /// Crate-local `Result` alias.
