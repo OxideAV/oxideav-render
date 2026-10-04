@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-render/compare/v0.0.4...v0.0.5) - 2026-10-04
+
+### Added
+
+- *(pathtrace)* expose GPU-port hooks — Sobol' direction numbers, sheen LUT, emissive light table, env-map CDFs, radiance_key, TraceScene::bvh
+- *(pathtrace)* Arvo 1995 spherical-triangle light sampling
+- *(pathtrace)* unbiased Monte Carlo path tracer backend (RenderBackend::PathTrace)
+- *(raycast)* trace the prepared scene; native glTF Pbr with ray-traced shadows, reflection, refraction, MASK/BLEND
+- *(trace)* ray-differential LOD, shadow transmittance, direct lighting, Snell/Fresnel helpers; share scanline Frame
+- *(trace)* shared ray-tracing layer over PreparedScene
+- camera target offset (pan), orthographic orbit zoom, Renderer::set_texture_resolver
+- *(scanline)* port onto the prep layer — clipping, perspective-correct visibility buffer, glTF PBR, alpha modes, shadow maps, band-parallel
+- public backend-agnostic scene preparation layer + public camera
+- texture resolution + CPU sampler, HDR image + tone mapping
+- Error::Backend for runtime backend failures (GPU adapter/device/readback)
+
+### Fixed
+
+- *(pathtrace)* glTF back-face normal-map orientation on double-sided materials
+- *(scanline)* crack-free shared edges + parallel display transform
+
+### Other
+
+- *(pathtrace)* parallel display resolve (1080p image() in 7.8 ms)
+- path tracer in README / CHANGELOG / BENCHMARKS; criterion pathtrace group
+- raycast Pbr (shadows, reflection, refraction, MASK/BLEND), trace layer additions, raycast benchmarks
+- *(raycast)* adaptive BVH builder, all-core tile workers; raycast PBR benches
+- crate overview of the shared layers; BENCHMARKS for the prep-layer scanline
+- README/CHANGELOG for the prep layer, textures, HDR, Pbr scanline; PBR bench rows
+- shared procedural test scenes, image metrics, PBR property suite + raw goldens
+- traverse via mesh3d's SAH Bvh::closest_hit / occluded
+
 ### Added
 
 - **`RenderBackend::PathTrace`** (`pathtrace`, registry name
