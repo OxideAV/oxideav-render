@@ -47,6 +47,11 @@ thiserror = "1"
 # (png / bmp / gif / tiff / cinepak / tta / flac) already track.
 criterion = "0.5"
 
+# PNG encode/decode for the golden-image harness, the testscene dump
+# example and the registry texture-resolver test (dev only — the
+# library itself never links a codec).
+oxideav-png = "0.1"
+
 [[bench]]
 name = "render"
 harness = false

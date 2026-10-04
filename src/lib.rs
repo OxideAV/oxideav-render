@@ -72,6 +72,7 @@ mod raycast;
 pub mod registry;
 mod scanline;
 mod shade;
+pub mod testscenes;
 pub mod texture;
 
 #[cfg(feature = "registry")]
