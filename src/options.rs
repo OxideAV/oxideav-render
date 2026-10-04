@@ -31,6 +31,74 @@ pub enum RenderBackend {
     /// to [`RenderOptions::max_ray_depth`] bounces. Line and point
     /// topologies have no surface area and are invisible to rays.
     Raycast,
+    /// Unbiased Monte Carlo path tracer (Kajiya 1986): next-event
+    /// estimation to punctual and emissive-triangle lights with
+    /// multiple importance sampling, the glTF metallic-roughness BSDF
+    /// plus transmission / volume / clearcoat / sheen / specular,
+    /// Russian roulette, and a uniform sky ([`RenderOptions::ambient`]).
+    /// Controlled by [`RenderOptions::path_trace`]; ignores
+    /// [`RenderOptions::shading`] and [`RenderOptions::aa`] (the
+    /// per-pixel sample count anti-aliases). See
+    /// [`crate::pathtrace`].
+    PathTrace,
+}
+
+/// Which estimator the path tracer uses for light that *can* be
+/// sampled explicitly (emissive triangles, an environment map).
+/// Punctual lights are always sampled by next-event estimation.
+/// [`LightStrategy::Mis`] is the production default; the others exist
+/// to verify it (all three converge to the same image).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LightStrategy {
+    /// Light sampling and BSDF sampling combined with the power
+    /// heuristic (Veach 1997, §9.2).
+    #[default]
+    Mis,
+    /// Next-event estimation only; emitters found by BSDF rays are
+    /// ignored.
+    LightOnly,
+    /// BSDF sampling only; no next-event estimation to area lights /
+    /// environment maps.
+    BsdfOnly,
+}
+
+/// Path-tracer controls ([`RenderBackend::PathTrace`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathTraceOptions {
+    /// Samples per pixel a full [`crate::Renderer::render`] takes
+    /// (`1..=1_048_576`). Default `64`.
+    pub samples_per_pixel: u32,
+    /// Maximum number of scattering events per path (`0..=1024`). `0`
+    /// shows emitters only, `1` is direct lighting, larger values add
+    /// indirect bounces. Default `8`.
+    pub max_bounces: u32,
+    /// Bounce index from which Russian roulette may terminate paths.
+    /// Default `3`.
+    pub rr_start: u32,
+    /// Firefly clamp: every non-camera-visible radiance contribution
+    /// is scaled so its largest channel is at most this value. `0`
+    /// (default) disables the clamp; any other value biases the
+    /// estimate (darker highlights) in exchange for less noise.
+    pub clamp: f32,
+    /// Seed mixed into every pixel's sample sequence. Renders are a
+    /// deterministic function of (scene, options, seed).
+    pub seed: u32,
+    /// Area-light / environment estimator. Default MIS.
+    pub strategy: LightStrategy,
+}
+
+impl Default for PathTraceOptions {
+    fn default() -> Self {
+        Self {
+            samples_per_pixel: 64,
+            max_bounces: 8,
+            rr_start: 3,
+            clamp: 0.0,
+            seed: 0,
+            strategy: LightStrategy::Mis,
+        }
+    }
 }
 
 /// Shading model selector consumed by every backend.
@@ -241,6 +309,9 @@ pub struct RenderOptions {
     /// traced reflection fades in as `(1 − roughness / cutoff)²`. `0`
     /// disables reflection rays. In `[0, 1]`; default `0.5`.
     pub reflection_roughness_cutoff: f32,
+    /// Path-tracer controls (sample count, bounces, clamp, seed);
+    /// ignored by the other backends.
+    pub path_trace: PathTraceOptions,
 }
 
 impl Default for RenderOptions {
@@ -268,6 +339,7 @@ impl Default for RenderOptions {
             material_variant: None,
             max_ray_depth: 4,
             reflection_roughness_cutoff: 0.5,
+            path_trace: PathTraceOptions::default(),
         }
     }
 }
@@ -297,6 +369,9 @@ impl RenderOptions {
     /// * `exposure` and `ambient` are finite and `>= 0.0`; `time` (if
     ///   set) is finite; `shadow_map_size` is within `16..=8192`;
     ///   `reflection_roughness_cutoff` is within `[0, 1]`.
+    /// * `path_trace.samples_per_pixel` is within `1..=1048576`,
+    ///   `path_trace.max_bounces <= 1024`, `path_trace.clamp` finite
+    ///   and `>= 0`.
     ///
     /// `validate` is **not** called automatically by [`crate::Renderer::render`]
     /// — backends today silently clamp instead — so a caller that wants
@@ -383,6 +458,25 @@ impl RenderOptions {
                 self.shadow_map_size
             )));
         }
+        let pt = &self.path_trace;
+        if !(1..=1 << 20).contains(&pt.samples_per_pixel) {
+            return Err(Error::InvalidOptions(format!(
+                "path_trace.samples_per_pixel must be in 1..=1048576, got {}",
+                pt.samples_per_pixel
+            )));
+        }
+        if pt.max_bounces > 1024 {
+            return Err(Error::InvalidOptions(format!(
+                "path_trace.max_bounces must be <= 1024, got {}",
+                pt.max_bounces
+            )));
+        }
+        if !pt.clamp.is_finite() || pt.clamp < 0.0 {
+            return Err(Error::InvalidOptions(format!(
+                "path_trace.clamp must be finite and >= 0.0, got {}",
+                pt.clamp
+            )));
+        }
         if let Some(cam) = self.camera {
             if !cam.azimuth_deg.is_finite() || !cam.elevation_deg.is_finite() {
                 return Err(Error::InvalidOptions(format!(
@@ -422,11 +516,16 @@ mod tests {
     }
 
     #[test]
-    fn backend_enum_phase_d_has_scanline_and_raycast() {
-        // Compile-time pin: both live backends stay constructible and
-        // distinct. Phase E extends this with `PathTrace`.
+    fn backend_enum_has_all_three_backends() {
+        // Compile-time pin: every live backend stays constructible and
+        // distinct.
         assert_ne!(RenderBackend::Scanline, RenderBackend::Raycast);
-        for backend in [RenderBackend::Scanline, RenderBackend::Raycast] {
+        assert_ne!(RenderBackend::Raycast, RenderBackend::PathTrace);
+        for backend in [
+            RenderBackend::Scanline,
+            RenderBackend::Raycast,
+            RenderBackend::PathTrace,
+        ] {
             assert!(crate::make_renderer(backend).is_ok(), "{backend:?}");
         }
     }
@@ -452,6 +551,20 @@ mod tests {
             },
             RenderOptions {
                 reflection_roughness_cutoff: f32::NAN,
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                path_trace: PathTraceOptions {
+                    samples_per_pixel: 0,
+                    ..PathTraceOptions::default()
+                },
+                ..RenderOptions::default()
+            },
+            RenderOptions {
+                path_trace: PathTraceOptions {
+                    clamp: -1.0,
+                    ..PathTraceOptions::default()
+                },
                 ..RenderOptions::default()
             },
         ] {

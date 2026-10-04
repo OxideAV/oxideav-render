@@ -95,7 +95,7 @@ impl std::fmt::Debug for RenderRegistry {
 /// Populate `reg` with every built-in backend.
 ///
 /// Phase B shipped the scanline rasteriser, Phase D the Whitted ray
-/// tracer; Phase E will add `"pathtrace"`. The string keys are the
+/// tracer, Phase E the `"pathtrace"` Monte Carlo path tracer. The string keys are the
 /// JSON-graph convention used by `oxideav-pipeline`'s
 /// `DagNode::Render3D` — lowercase, no `RenderBackend::` prefix.
 pub fn register_into(reg: &mut RenderRegistry) {
@@ -106,6 +106,10 @@ pub fn register_into(reg: &mut RenderRegistry) {
     reg.register(
         "raycast",
         Box::new(|| crate::make_renderer(RenderBackend::Raycast)),
+    );
+    reg.register(
+        "pathtrace",
+        Box::new(|| crate::make_renderer(RenderBackend::PathTrace)),
     );
 }
 
@@ -131,7 +135,7 @@ mod tests {
         let mut reg = RenderRegistry::new();
         register_into(&mut reg);
         let names = reg.names();
-        for expected in ["scanline", "raycast"] {
+        for expected in ["scanline", "raycast", "pathtrace"] {
             assert!(
                 names.contains(&expected),
                 "register_into must register \"{expected}\", got {names:?}"

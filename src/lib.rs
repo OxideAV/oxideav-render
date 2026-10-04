@@ -77,6 +77,7 @@ pub mod hdr;
 pub mod image;
 mod math;
 pub mod options;
+pub mod pathtrace;
 pub mod prepare;
 mod raster;
 mod raycast;
@@ -95,8 +96,10 @@ pub use error::{Error, Result};
 pub use hdr::{HdrImage, ToneMap};
 pub use image::RgbaImage;
 pub use options::{
-    BackgroundColor, CameraSpec, LightSpec, Projection, RenderBackend, RenderOptions, ShadingMode,
+    BackgroundColor, CameraSpec, LightSpec, LightStrategy, PathTraceOptions, Projection,
+    RenderBackend, RenderOptions, ShadingMode,
 };
+pub use pathtrace::{EnvironmentMap, PathTraceRenderer, PathTracer};
 pub use prepare::{
     DrawItem, DrawTopology, LightKind, PrepareOptions, PreparedLight, PreparedMaterial,
     PreparedScene, TextureBinding,
@@ -158,12 +161,13 @@ pub trait Renderer: Send {
 /// Construct a renderer for `backend`.
 ///
 /// Phase B routes `Scanline` to the in-tree scanline backend; Phase D
-/// routes `Raycast` to the Whitted ray tracer. Phase E fills in
-/// `PathTrace`.
+/// routes `Raycast` to the Whitted ray tracer; Phase E routes
+/// `PathTrace` to the Monte Carlo path tracer ([`pathtrace`]).
 pub fn make_renderer(backend: RenderBackend) -> Result<Box<dyn Renderer>> {
     match backend {
         RenderBackend::Scanline => Ok(Box::new(ScanlineRenderer::new())),
         RenderBackend::Raycast => Ok(Box::new(RaycastRenderer::new())),
+        RenderBackend::PathTrace => Ok(Box::new(PathTraceRenderer::new())),
     }
 }
 
@@ -378,8 +382,12 @@ mod robustness_tests {
     use super::*;
     use oxideav_mesh3d::{Indices, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology};
 
-    fn both_backends() -> [RenderBackend; 2] {
-        [RenderBackend::Scanline, RenderBackend::Raycast]
+    fn both_backends() -> [RenderBackend; 3] {
+        [
+            RenderBackend::Scanline,
+            RenderBackend::Raycast,
+            RenderBackend::PathTrace,
+        ]
     }
 
     fn tiny_opts() -> RenderOptions {
@@ -388,6 +396,11 @@ mod robustness_tests {
             height: 16,
             background: BackgroundColor([9, 9, 9, 255]),
             shading: ShadingMode::Flat,
+            path_trace: PathTraceOptions {
+                samples_per_pixel: 2,
+                max_bounces: 2,
+                ..PathTraceOptions::default()
+            },
             ..RenderOptions::default()
         }
     }
@@ -563,7 +576,7 @@ mod robustness_tests {
             let opts = RenderOptions {
                 width: 1,
                 height: 1,
-                ..RenderOptions::default()
+                ..tiny_opts()
             };
             let img = renderer.render(&scene, &opts).expect("render");
             assert_eq!((img.width, img.height), (1, 1), "{backend:?}");

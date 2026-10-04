@@ -1,18 +1,30 @@
 //! Render every `oxideav_render::testscenes` scene with the scanline
-//! backend in PBR mode and write PNGs to the directory given as the
-//! first argument (default: current directory).
+//! backend in PBR mode (or the backend named by the second argument:
+//! `scanline`, `raycast`, `pathtrace`; the third argument sets the
+//! path tracer's samples per pixel, default 64) and write PNGs to the
+//! directory given as the first argument (default: current directory).
 //!
-//! `cargo run -p oxideav-render --example dump_testscenes --release -- out/`
+//! `cargo run -p oxideav-render --example dump_testscenes --release -- out/ pathtrace 256`
 
 use oxideav_mesh3d::Sampler;
 use oxideav_render::testscenes::*;
 use oxideav_render::{
-    make_renderer, BackgroundColor, RenderBackend, RenderOptions, ShadingMode, ToneMap,
+    make_renderer, BackgroundColor, PathTraceOptions, RenderBackend, RenderOptions, ShadingMode,
+    ToneMap,
 };
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
     std::fs::create_dir_all(&dir).expect("create output dir");
+    let backend = match std::env::args().nth(2).as_deref() {
+        Some("pathtrace") => RenderBackend::PathTrace,
+        Some("raycast") => RenderBackend::Raycast,
+        _ => RenderBackend::Scanline,
+    };
+    let spp = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
     let scenes = [
         ("cornell", cornell_box(), None),
         ("spheres", sphere_grid(5, 4), None),
@@ -38,10 +50,14 @@ fn main() {
             shadows: true,
             aa: 2,
             time,
+            path_trace: PathTraceOptions {
+                samples_per_pixel: spp,
+                ..PathTraceOptions::default()
+            },
             ..RenderOptions::default()
         };
         let t = std::time::Instant::now();
-        let img = make_renderer(RenderBackend::Scanline)
+        let img = make_renderer(backend)
             .expect("renderer")
             .render(&scene, &opts)
             .expect("render");
