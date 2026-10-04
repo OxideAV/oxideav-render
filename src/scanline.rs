@@ -1,605 +1,839 @@
-//! Scanline software rasteriser — the Phase B backend behind
+//! Scanline software rasteriser — the backend behind
 //! [`crate::RenderBackend::Scanline`].
 //!
-//! Pure-Rust, zero external rendering dependencies. Walks the
-//! [`Scene3D`](oxideav_mesh3d::Scene3D) node forest, projects every
-//! vertex through a model-view-projection chain, then rasterises one
-//! triangle / line / point at a time with a half-space edge-function
-//! pipeline backed by a per-pixel z-buffer.
+//! Pure-Rust, zero external rendering dependencies. The scene is
+//! flattened by the shared [`crate::prepare`] layer (animation,
+//! morphs, skinning, world-space attributes, materials, textures,
+//! lights), framed by the shared [`crate::camera::Camera`], and drawn
+//! in passes by the [`crate::raster`] core:
 //!
-//! Migration provenance: the algorithms here were authored in
-//! `oxideav-cli-convert/src/mesh3d_render.rs` (round 44 + 45 in that
-//! crate) and moved verbatim into this crate in Phase B so the renderer
-//! lives behind a stable trait. Phase D split the backend-agnostic
-//! camera framing ([`crate::camera`]), vector/matrix maths
-//! ([`crate::math`]), and shading/colour helpers ([`crate::shade`])
-//! into shared modules consumed by both this backend and the raycast
-//! backend.
+//! 1. **Shadow maps** (optional, [`ShadingMode::Pbr`] +
+//!    [`RenderOptions::shadows`]) — one depth map per directional /
+//!    spot light (Williams, "Casting Curved Shadows on Curved
+//!    Surfaces", SIGGRAPH 1978), sampled with 3×3 bilinear
+//!    percentage-closer filtering (Reeves, Salesin, Cook, "Rendering
+//!    Antialiased Shadows with Depth Maps", SIGGRAPH 1987) and a
+//!    normal-offset + constant bias.
+//! 2. **Visibility pass** — opaque and alpha-masked triangles (MASK
+//!    cutoff evaluated per fragment), then lines / points, into a
+//!    depth + primitive-id + barycentric buffer (clipped,
+//!    perspective-correct, top-left fill rule, back-face culling for
+//!    single-sided PBR materials).
+//! 3. **Resolve** — every visible pixel is shaded exactly once in
+//!    scene-linear `f32`.
+//! 4. **Blend pass** ([`ShadingMode::Pbr`]) — `BLEND` triangles sorted
+//!    back-to-front by view depth, depth-tested against the opaque
+//!    result without depth writes, shaded forward and composited with
+//!    the straight-alpha *over* operator (Porter & Duff, "Compositing
+//!    Digital Images", SIGGRAPH 1984).
+//! 5. **Display** — exposure, [`crate::ToneMap`], SSAA box filter
+//!    (premultiplied), sRGB encode. Background samples bypass tone
+//!    mapping so the requested background bytes come back verbatim.
 //!
-//! Clean-room policy: every algorithm here has a textbook source.
-//! Half-space edge-function rasterisation traces to Pineda's 1988
-//! SIGGRAPH paper "A Parallel Algorithm for Polygon Rasterization".
-//! Bresenham's 1965 IBM Systems Journal paper covers the line walker.
-//! sRGB encoding follows IEC 61966-2-1. Look-at / perspective /
-//! orthographic matrices use the standard right-handed conventions.
-//! No reference renderer source code was consulted at any stage.
+//! Shading modes: `Flat` / `Gouraud` / `Phong` / `Wireframe` keep the
+//! historical model (material base-colour factor, the options'
+//! directional light, constant 0.2 ambient — shared with the raycast
+//! backend via [`crate::shade`]); `NormalDebug` / `DepthDebug` are
+//! colour-keyed visualisers; `Pbr` is the glTF 2.0 metallic-roughness
+//! model of [`crate::brdf`] with textures, normal / occlusion /
+//! emissive maps, vertex colours, unlit, punctual lights, alpha modes
+//! and shadows.
+//!
+//! Clean-room policy: every algorithm has a published source, cited at
+//! its implementation. No reference renderer source code was consulted.
 
-use oxideav_mesh3d::{Indices, Material, Primitive, Scene3D, Topology};
+use oxideav_mesh3d::{AlphaMode, Scene3D};
 
-use crate::camera::{scene_bbox, Camera};
-use crate::image::{downsample_box, RgbaImage};
-use crate::math::{
-    mat3_mul_vec3, mat4_mul, mat4_mul_point, mat4_mul_vec4, vec3_cross, vec3_normalise, vec3_sub,
+use crate::brdf::{self, BrdfParams};
+use crate::camera::{look_at, orthographic, perspective, Camera};
+use crate::hdr::{linear_to_srgb_byte, srgb_u8_lut, HdrImage};
+use crate::image::RgbaImage;
+use crate::math::{mat4_mul, mat4_mul_vec4, vec3_cross, vec3_dot, vec3_normalise, vec3_sub};
+use crate::options::{Projection, RenderOptions, ShadingMode};
+use crate::prepare::{
+    DrawItem, DrawTopology, LightKind, PrepareOptions, PreparedLight, PreparedMaterial,
+    PreparedScene, TextureBinding,
 };
-use crate::options::{RenderOptions, ShadingMode};
-use crate::shade::{build_light, linear_rgba_to_srgb_u8, shade_pixel, DirLight};
+use crate::raster::{
+    bin_tris, par_bands, raster_visibility, setup_line, setup_point, setup_triangle, Cull,
+    ScreenLine, ScreenTri, VisPixel, LINE_FLAG, NONE,
+};
+use crate::shade::{build_light, shade_pixel, DirLight};
+use crate::texture::{ColorSpace, TextureCache};
 
 // ---------------------------------------------------------------------
-// Public entry point.
+// Public entry points.
 // ---------------------------------------------------------------------
 
-/// Render `scene` into a packed RGBA8 buffer per `opts`.
-///
-/// When `opts.aa >= 2`, the scene is rasterised at
-/// `aa × width` × `aa × height` and box-filtered back down to the
-/// requested output — classic SSAA, no temporal jitter, no rotated
-/// grid.
-pub fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
+/// Render `scene` into a packed RGBA8 image per `opts`, resolving only
+/// built-in raw textures.
+#[cfg(test)]
+pub(crate) fn render_scene(scene: &Scene3D, opts: &RenderOptions) -> RgbaImage {
+    render_with_cache(scene, opts, &mut TextureCache::default())
+}
+
+/// [`render_scene`] decoding textures through `cache`.
+pub(crate) fn render_with_cache(
+    scene: &Scene3D,
+    opts: &RenderOptions,
+    cache: &mut TextureCache,
+) -> RgbaImage {
+    let frame = render_frame(scene, opts, cache);
+    frame.to_rgba8(opts)
+}
+
+/// Scene-linear output (pre exposure / tone map).
+pub(crate) fn render_hdr_with_cache(
+    scene: &Scene3D,
+    opts: &RenderOptions,
+    cache: &mut TextureCache,
+) -> HdrImage {
+    let frame = render_frame(scene, opts, cache);
+    frame.to_hdr()
+}
+
+// ---------------------------------------------------------------------
+// Frame result + display transform.
+// ---------------------------------------------------------------------
+
+/// One shaded sample: scene-linear straight-alpha colour, and whether
+/// any geometry covers it.
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    c: [f32; 4],
+    covered: bool,
+}
+
+struct Frame {
+    out_w: u32,
+    out_h: u32,
+    aa: u32,
+    samples: Vec<Sample>,
+    background: [u8; 4],
+    /// Debug visualisers: display transform is a plain clamp.
+    display_referred: bool,
+}
+
+impl Frame {
+    fn bg_linear(&self) -> [f32; 4] {
+        let lut = srgb_u8_lut();
+        let b = self.background;
+        [
+            lut[b[0] as usize],
+            lut[b[1] as usize],
+            lut[b[2] as usize],
+            b[3] as f32 / 255.0,
+        ]
+    }
+
+    /// Box-filter the `aa × aa` sample block of every output pixel,
+    /// mapping each sample through `map` first; averages premultiplied
+    /// by alpha (straight average when the block is fully
+    /// transparent).
+    fn resolve(&self, map: impl Fn(&Sample) -> [f32; 4]) -> Vec<[f32; 4]> {
+        let aa = self.aa as usize;
+        let rw = self.out_w as usize * aa;
+        let mut out = Vec::with_capacity(self.out_w as usize * self.out_h as usize);
+        for oy in 0..self.out_h as usize {
+            for ox in 0..self.out_w as usize {
+                let mut pre = [0.0f32; 3];
+                let mut straight = [0.0f32; 3];
+                let mut a_sum = 0.0f32;
+                for j in 0..aa {
+                    for i in 0..aa {
+                        let s = &self.samples[(oy * aa + j) * rw + ox * aa + i];
+                        let c = map(s);
+                        for k in 0..3 {
+                            pre[k] += c[k] * c[3];
+                            straight[k] += c[k];
+                        }
+                        a_sum += c[3];
+                    }
+                }
+                let n = (aa * aa) as f32;
+                out.push(if a_sum > 0.0 {
+                    [pre[0] / a_sum, pre[1] / a_sum, pre[2] / a_sum, a_sum / n]
+                } else {
+                    [straight[0] / n, straight[1] / n, straight[2] / n, 0.0]
+                });
+            }
+        }
+        out
+    }
+
+    fn to_rgba8(&self, opts: &RenderOptions) -> RgbaImage {
+        let bg = self.bg_linear();
+        let (tm, exposure) = if self.display_referred {
+            (crate::hdr::ToneMap::Clamp, 1.0)
+        } else {
+            (opts.tone_map, opts.exposure)
+        };
+        let px = self.resolve(|s| {
+            if !s.covered {
+                return bg;
+            }
+            let m = tm.apply([s.c[0] * exposure, s.c[1] * exposure, s.c[2] * exposure]);
+            [m[0], m[1], m[2], s.c[3].clamp(0.0, 1.0)]
+        });
+        let mut pixels = Vec::with_capacity(px.len() * 4);
+        for c in px {
+            pixels.push(linear_to_srgb_byte(c[0]));
+            pixels.push(linear_to_srgb_byte(c[1]));
+            pixels.push(linear_to_srgb_byte(c[2]));
+            pixels.push((c[3].clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+        RgbaImage {
+            width: self.out_w,
+            height: self.out_h,
+            stride: self.out_w as usize * 4,
+            pixels,
+        }
+    }
+
+    fn to_hdr(&self) -> HdrImage {
+        let bg = self.bg_linear();
+        let px = self.resolve(|s| if s.covered { s.c } else { bg });
+        HdrImage {
+            width: self.out_w,
+            height: self.out_h,
+            pixels: px.into_iter().flatten().collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Frame rendering.
+// ---------------------------------------------------------------------
+
+/// Global triangle reference: item index + triangle index in the item.
+#[derive(Debug, Clone, Copy)]
+struct TriRef {
+    item: u32,
+    tri: u32,
+}
+
+/// Line / point reference: item + the two corner vertex indices.
+#[derive(Debug, Clone, Copy)]
+struct LineRef {
+    item: u32,
+    a: u32,
+    b: u32,
+}
+
+fn render_frame(scene: &Scene3D, opts: &RenderOptions, cache: &mut TextureCache) -> Frame {
     let width = opts.width.max(1);
     let height = opts.height.max(1);
     let aa = opts.aa.clamp(1, 8);
-    let render_w = width.saturating_mul(aa).max(1);
-    let render_h = height.saturating_mul(aa).max(1);
-
-    let background = opts.background.0;
-    let mut fb = Framebuffer::new(render_w, render_h, background);
-
-    let bbox = scene_bbox(scene);
-    let camera = Camera::build(render_w, render_h, bbox, opts);
-    let light = build_light(opts.light);
+    let rw = width.saturating_mul(aa).max(1);
+    let rh = height.saturating_mul(aa).max(1);
     let mode = opts.shading;
+    let pbr = mode == ShadingMode::Pbr;
 
-    // Walk the node forest in pre-order, composing world matrices.
-    // The iterative walk claims each node once at first arrival so a
-    // cyclic / diamond-shaped node graph terminates and arbitrarily
-    // deep hierarchies cannot overflow the call stack (see
-    // `camera::walk_scene_preorder` for the traversal contract).
-    crate::camera::walk_scene_preorder(scene, |node, world| {
-        if let Some(mesh_id) = node.mesh {
-            if let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) {
-                for prim in &mesh.primitives {
-                    let colour = primitive_colour_linear(scene, prim);
-                    draw_primitive(prim, world, &camera, &light, colour, &mut fb, mode);
+    let prepared = PreparedScene::build(scene, &PrepareOptions::from_render_options(opts), cache);
+    let camera = Camera::resolve(&prepared, opts, rw, rh);
+    let vp = mat4_mul(camera.proj, camera.view);
+
+    // ---- Collect primitives.
+    let mut tri_refs: Vec<TriRef> = Vec::new();
+    let mut screen_tris: Vec<ScreenTri> = Vec::new();
+    let mut blend: Vec<(f32, TriRef)> = Vec::new();
+    let mut line_refs: Vec<LineRef> = Vec::new();
+    let mut screen_lines: Vec<ScreenLine> = Vec::new();
+    let clip = |p: [f32; 3]| mat4_mul_vec4(&vp, [p[0], p[1], p[2], 1.0]);
+
+    for (ii, item) in prepared.items.iter().enumerate() {
+        let mat = &prepared.materials[item.material];
+        match item.topology {
+            DrawTopology::Triangles if mode == ShadingMode::Wireframe => {
+                for t in 0..item.positions.len() / 3 {
+                    let b = 3 * t as u32;
+                    for (a, c) in [(b, b + 1), (b + 1, b + 2), (b + 2, b)] {
+                        push_line(
+                            &mut line_refs,
+                            &mut screen_lines,
+                            LineRef {
+                                item: ii as u32,
+                                a,
+                                b: c,
+                            },
+                            clip(item.positions[a as usize]),
+                            clip(item.positions[c as usize]),
+                            rw,
+                            rh,
+                        );
+                    }
                 }
             }
-        }
-    });
-
-    let img = fb.into_image();
-    if aa <= 1 {
-        img
-    } else {
-        downsample_box(&img, width, height, aa)
-    }
-}
-
-// ---------------------------------------------------------------------
-// Scene walk.
-// ---------------------------------------------------------------------
-
-/// Linear-space (0..=1 RGBA, premultiplied alpha NOT applied) colour for
-/// a primitive. We keep the colour in linear space for shading and only
-/// convert to sRGB right before writing to the framebuffer.
-fn primitive_colour_linear(scene: &Scene3D, prim: &Primitive) -> [f32; 4] {
-    let mat = prim
-        .material
-        .and_then(|mid| scene.materials.get(mid.0 as usize));
-    mat.map(|m: &Material| m.base_color)
-        .unwrap_or([0.7, 0.7, 0.75, 1.0])
-}
-
-// ---------------------------------------------------------------------
-// Per-primitive triangle / line / point expansion + rasterise.
-// ---------------------------------------------------------------------
-
-/// Triangle-list expansion + projection + rasterisation for one
-/// [`Primitive`]. Lines / line strips / line loops / points / triangle
-/// strips / fans are all walked into ordered `(i0, i1, i2)` triplets
-/// here so the inner draw loop is topology-agnostic.
-fn draw_primitive(
-    prim: &Primitive,
-    world: &[[f32; 4]; 4],
-    camera: &Camera,
-    light: &DirLight,
-    colour_linear: [f32; 4],
-    fb: &mut Framebuffer,
-    mode: ShadingMode,
-) {
-    if prim.positions.is_empty() {
-        return;
-    }
-
-    // Project every vertex once.
-    let view_proj = mat4_mul(camera.proj, camera.view);
-    let mvp = mat4_mul(view_proj, *world);
-    let projected: Vec<Option<[f32; 3]>> = prim
-        .positions
-        .iter()
-        .map(|p| project_vertex(*p, &mvp, fb.width as f32, fb.height as f32))
-        .collect();
-
-    // World-space normals are needed for Gouraud / Phong / NormalDebug.
-    // The world matrix is assumed rigid+uniform-scale (the only kind
-    // composed from `Transform::translation/rotation/scale`); its 3x3
-    // upper-left therefore suffices for normal transformation (no
-    // inverse-transpose needed). DepthDebug doesn't need normals, and
-    // Flat / Wireframe never look at them.
-    let world_normals: Option<Vec<[f32; 3]>> = match mode {
-        ShadingMode::Gouraud | ShadingMode::Phong | ShadingMode::Pbr | ShadingMode::NormalDebug => {
-            Some(
-                prim.normals
-                    .as_ref()
-                    .map(|ns| {
-                        ns.iter()
-                            .map(|n| vec3_normalise(mat3_mul_vec3(world, *n)))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        }
-        _ => None,
-    };
-
-    // Walk the topology and draw each triangle / line.
-    let indices: Vec<u32> = match &prim.indices {
-        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
-        Some(Indices::U32(v)) => v.clone(),
-        None => (0..prim.positions.len() as u32).collect(),
-    };
-    let n = indices.len();
-
-    match prim.topology {
-        Topology::Triangles => {
-            let mut i = 0;
-            while i + 2 < n {
-                draw_tri(
-                    prim,
-                    world,
-                    world_normals.as_deref(),
-                    &projected,
-                    indices[i] as usize,
-                    indices[i + 1] as usize,
-                    indices[i + 2] as usize,
-                    colour_linear,
-                    light,
-                    fb,
-                    mode,
-                );
-                i += 3;
-            }
-        }
-        Topology::TriangleStrip => {
-            let mut i = 0;
-            while i + 2 < n {
-                let (a, b, c) = if i % 2 == 0 {
-                    (indices[i], indices[i + 1], indices[i + 2])
+            DrawTopology::Triangles => {
+                let cull = if pbr && !mat.double_sided {
+                    Cull::Back
                 } else {
-                    (indices[i + 1], indices[i], indices[i + 2])
+                    Cull::None
                 };
-                draw_tri(
-                    prim,
-                    world,
-                    world_normals.as_deref(),
-                    &projected,
-                    a as usize,
-                    b as usize,
-                    c as usize,
-                    colour_linear,
-                    light,
-                    fb,
-                    mode,
-                );
-                i += 1;
-            }
-        }
-        Topology::TriangleFan => {
-            if n >= 3 {
-                for i in 1..(n - 1) {
-                    draw_tri(
-                        prim,
-                        world,
-                        world_normals.as_deref(),
-                        &projected,
-                        indices[0] as usize,
-                        indices[i] as usize,
-                        indices[i + 1] as usize,
-                        colour_linear,
-                        light,
-                        fb,
-                        mode,
+                let masked = pbr && matches!(mat.alpha_mode, AlphaMode::Mask { .. });
+                for (t, v) in item.positions.chunks_exact(3).enumerate() {
+                    let r = TriRef {
+                        item: ii as u32,
+                        tri: t as u32,
+                    };
+                    if pbr && mat.alpha_mode == AlphaMode::Blend {
+                        let c = [
+                            (v[0][0] + v[1][0] + v[2][0]) / 3.0,
+                            (v[0][1] + v[1][1] + v[2][1]) / 3.0,
+                            (v[0][2] + v[1][2] + v[2][2]) / 3.0,
+                        ];
+                        blend.push((camera.view_depth(c), r));
+                        continue;
+                    }
+                    let id = tri_refs.len() as u32;
+                    tri_refs.push(r);
+                    setup_triangle(
+                        [clip(v[0]), clip(v[1]), clip(v[2])],
+                        id,
+                        cull,
+                        masked,
+                        rw,
+                        rh,
+                        &mut screen_tris,
                     );
                 }
             }
-        }
-        Topology::Lines => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            let mut i = 0;
-            while i + 1 < n {
-                draw_line_pair(
-                    &projected,
-                    indices[i] as usize,
-                    indices[i + 1] as usize,
-                    colour_srgb,
-                    fb,
-                );
-                i += 2;
+            DrawTopology::Lines => {
+                for s in 0..item.positions.len() / 2 {
+                    let (a, b) = (2 * s as u32, 2 * s as u32 + 1);
+                    push_line(
+                        &mut line_refs,
+                        &mut screen_lines,
+                        LineRef {
+                            item: ii as u32,
+                            a,
+                            b,
+                        },
+                        clip(item.positions[a as usize]),
+                        clip(item.positions[b as usize]),
+                        rw,
+                        rh,
+                    );
+                }
             }
-        }
-        Topology::LineStrip => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            for i in 0..(n.saturating_sub(1)) {
-                draw_line_pair(
-                    &projected,
-                    indices[i] as usize,
-                    indices[i + 1] as usize,
-                    colour_srgb,
-                    fb,
-                );
-            }
-        }
-        Topology::LineLoop => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            for i in 0..(n.saturating_sub(1)) {
-                draw_line_pair(
-                    &projected,
-                    indices[i] as usize,
-                    indices[i + 1] as usize,
-                    colour_srgb,
-                    fb,
-                );
-            }
-            if n >= 2 {
-                draw_line_pair(
-                    &projected,
-                    indices[n - 1] as usize,
-                    indices[0] as usize,
-                    colour_srgb,
-                    fb,
-                );
-            }
-        }
-        Topology::Points => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            for &i in &indices {
-                if let Some(p) = projected.get(i as usize).and_then(|v| v.as_ref()) {
-                    let x = p[0].round() as i32;
-                    let y = p[1].round() as i32;
-                    fb.set_pixel(x, y, p[2], colour_srgb);
+            DrawTopology::Points => {
+                for (i, p) in item.positions.iter().enumerate() {
+                    if let Some(sl) = setup_point(clip(*p), rw, rh) {
+                        line_refs.push(LineRef {
+                            item: ii as u32,
+                            a: i as u32,
+                            b: i as u32,
+                        });
+                        screen_lines.push(sl);
+                    }
                 }
             }
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn draw_tri(
-    prim: &Primitive,
-    world: &[[f32; 4]; 4],
-    world_normals: Option<&[[f32; 3]]>,
-    projected: &[Option<[f32; 3]>],
-    a: usize,
-    b: usize,
-    c: usize,
-    colour_linear: [f32; 4],
-    light: &DirLight,
-    fb: &mut Framebuffer,
-    mode: ShadingMode,
-) {
-    let (Some(va), Some(vb), Some(vc)) = (
-        projected.get(a).and_then(|v| *v),
-        projected.get(b).and_then(|v| *v),
-        projected.get(c).and_then(|v| *v),
-    ) else {
-        return;
+    let ctx = ShadeCtx {
+        prepared: &prepared,
+        camera: &camera,
+        mode,
+        legacy_light: build_light(opts.light),
+        ambient: opts.ambient,
+        tri_refs: &tri_refs,
+        shadows: if pbr && opts.shadows {
+            build_shadow_maps(&prepared, opts.shadow_map_size.clamp(16, 8192))
+        } else {
+            Vec::new()
+        },
     };
-    match mode {
-        ShadingMode::Wireframe => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            draw_line(fb, va, vb, colour_srgb);
-            draw_line(fb, vb, vc, colour_srgb);
-            draw_line(fb, vc, va, colour_srgb);
-        }
-        ShadingMode::Flat => {
-            let colour_srgb = linear_rgba_to_srgb_u8(colour_linear);
-            rasterise_triangle_flat(fb, va, vb, vc, colour_srgb);
-        }
-        ShadingMode::Gouraud | ShadingMode::Phong | ShadingMode::Pbr => {
-            // Pick the three vertex normals for this triangle. Either
-            // pulled from the (transformed) per-vertex normal buffer, or
-            // synthesised from the face normal of the world-space
-            // positions.
-            let (na, nb, nc) = vertex_normals_for_face(prim, world, world_normals, a, b, c);
-            if matches!(mode, ShadingMode::Gouraud) {
-                // Light per-vertex, interpolate colour.
-                let ca = shade_pixel(colour_linear, na, light);
-                let cb = shade_pixel(colour_linear, nb, light);
-                let cc = shade_pixel(colour_linear, nc, light);
-                rasterise_triangle_gouraud(fb, va, vb, vc, ca, cb, cc);
+
+    // ---- Visibility pass.
+    let mask_test = |t: &ScreenTri, b: [f32; 3], x: i32, y: i32| -> bool {
+        let r = tri_refs[t.prim as usize];
+        let item = &prepared.items[r.item as usize];
+        let mat = &prepared.materials[item.material];
+        let AlphaMode::Mask { cutoff } = mat.alpha_mode else {
+            return true;
+        };
+        let g = Grads::of(t, b, x, y);
+        ctx.alpha(item, mat, 3 * r.tri as usize, b, &g) >= cutoff
+    };
+    let vis = raster_visibility(&screen_tris, &screen_lines, rw, rh, &mask_test);
+
+    // ---- Resolve.
+    let w = rw as usize;
+    let mut samples = vec![
+        Sample {
+            c: [0.0; 4],
+            covered: false,
+        };
+        w * rh as usize
+    ];
+    par_bands(&mut samples, w, |_, y0, rows| {
+        for (i, s) in rows.iter_mut().enumerate() {
+            let x = (i % w) as i32;
+            let y = (y0 + i / w) as i32;
+            let v = vis[y as usize * w + x as usize];
+            if v.id == NONE {
+                continue;
+            }
+            s.c = if v.id & LINE_FLAG != 0 {
+                ctx.shade_line(line_refs[(v.id & !LINE_FLAG) as usize], v.b[0])
             } else {
-                // Phong — interpolate normal, light per-pixel.
-                rasterise_triangle_phong(fb, va, vb, vc, na, nb, nc, colour_linear, light);
+                let t = &screen_tris[v.id as usize];
+                ctx.shade_tri(t, &v, x, y)
+            };
+            s.covered = true;
+        }
+    });
+
+    // ---- Blend pass.
+    if !blend.is_empty() {
+        // Back-to-front; stable so equal depths keep submission order.
+        blend.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut btris = Vec::new();
+        let mut brefs = Vec::new();
+        for (_, r) in &blend {
+            let item = &prepared.items[r.item as usize];
+            let mat = &prepared.materials[item.material];
+            let base = 3 * r.tri as usize;
+            let id = brefs.len() as u32;
+            brefs.push(*r);
+            setup_triangle(
+                [
+                    clip(item.positions[base]),
+                    clip(item.positions[base + 1]),
+                    clip(item.positions[base + 2]),
+                ],
+                id,
+                if mat.double_sided {
+                    Cull::None
+                } else {
+                    Cull::Back
+                },
+                false,
+                rw,
+                rh,
+                &mut btris,
+            );
+        }
+        let bins = bin_tris(&btris, rh);
+        let bg = {
+            let lut = srgb_u8_lut();
+            let b = opts.background.0;
+            [
+                lut[b[0] as usize],
+                lut[b[1] as usize],
+                lut[b[2] as usize],
+                b[3] as f32 / 255.0,
+            ]
+        };
+        let bctx = ShadeCtx {
+            tri_refs: &brefs,
+            ..ctx.clone_ctx()
+        };
+        par_bands(&mut samples, w, |band, y0, rows| {
+            let y1 = y0 + rows.len() / w;
+            for &ti in &bins[band] {
+                let t = &btris[ti as usize];
+                t.raster_rows(y0 as i32, y1 as i32, |x, y, z, b| {
+                    let gi = y as usize * w + x as usize;
+                    if z >= vis[gi].depth {
+                        return;
+                    }
+                    let v = VisPixel {
+                        depth: z,
+                        id: ti,
+                        b,
+                    };
+                    let src = bctx.shade_tri(t, &v, x, y);
+                    let s = &mut rows[gi - y0 * w];
+                    let dst = if s.covered { s.c } else { bg };
+                    s.c = over(src, dst);
+                    s.covered = true;
+                });
             }
-        }
-        ShadingMode::NormalDebug => {
-            let (na, nb, nc) = vertex_normals_for_face(prim, world, world_normals, a, b, c);
-            rasterise_triangle_normal_debug(fb, va, vb, vc, na, nb, nc);
-        }
-        ShadingMode::DepthDebug => {
-            rasterise_triangle_depth_debug(fb, va, vb, vc);
-        }
+        });
+    }
+
+    Frame {
+        out_w: width,
+        out_h: height,
+        aa,
+        samples,
+        background: opts.background.0,
+        display_referred: matches!(mode, ShadingMode::NormalDebug | ShadingMode::DepthDebug),
     }
 }
 
-/// Pick the three world-space vertex normals for a face. When the
-/// primitive has its own per-vertex normals (and they're long enough),
-/// those are used. Otherwise we fall back to the face normal computed
-/// from the world-space positions of the three vertices — Gouraud
-/// degenerates to flat in that case, but per-pixel Phong still
-/// interpolates a clean direction across the triangle.
-fn vertex_normals_for_face(
-    prim: &Primitive,
-    world: &[[f32; 4]; 4],
-    world_normals: Option<&[[f32; 3]]>,
-    a: usize,
-    b: usize,
-    c: usize,
-) -> ([f32; 3], [f32; 3], [f32; 3]) {
-    if let Some(ns) = world_normals {
-        if a < ns.len() && b < ns.len() && c < ns.len() {
-            return (ns[a], ns[b], ns[c]);
-        }
-    }
-    // Fall back to face normal in world space.
-    let pa = prim.positions.get(a).copied().unwrap_or([0.0, 0.0, 0.0]);
-    let pb = prim.positions.get(b).copied().unwrap_or([0.0, 0.0, 0.0]);
-    let pc = prim.positions.get(c).copied().unwrap_or([0.0, 0.0, 0.0]);
-    let wa = mat4_mul_point(world, pa);
-    let wb = mat4_mul_point(world, pb);
-    let wc = mat4_mul_point(world, pc);
-    let n = vec3_normalise(vec3_cross(vec3_sub(wb, wa), vec3_sub(wc, wa)));
-    (n, n, n)
-}
-
-fn draw_line_pair(
-    projected: &[Option<[f32; 3]>],
-    a: usize,
-    b: usize,
-    colour: [u8; 4],
-    fb: &mut Framebuffer,
+fn push_line(
+    refs: &mut Vec<LineRef>,
+    lines: &mut Vec<ScreenLine>,
+    r: LineRef,
+    a: [f32; 4],
+    b: [f32; 4],
+    w: u32,
+    h: u32,
 ) {
-    let (Some(va), Some(vb)) = (
-        projected.get(a).and_then(|v| *v),
-        projected.get(b).and_then(|v| *v),
-    ) else {
-        return;
-    };
-    draw_line(fb, va, vb, colour);
+    if let Some(l) = setup_line(a, b, w, h) {
+        refs.push(r);
+        lines.push(l);
+    }
 }
 
-/// Project an object-space vertex through the model-view-projection
-/// matrix, perspective-divide, and map to viewport pixel coords.
-/// Returns `None` for vertices behind the near plane (`w <= 0`); the
-/// caller skips any triangle / line that touches a clipped vertex.
-fn project_vertex(pos: [f32; 3], mvp: &[[f32; 4]; 4], width: f32, height: f32) -> Option<[f32; 3]> {
-    let v = mat4_mul_vec4(mvp, [pos[0], pos[1], pos[2], 1.0]);
-    if v[3] <= 0.0 {
-        return None;
+/// Straight-alpha Porter–Duff *over*.
+fn over(src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
+    let a = src[3].clamp(0.0, 1.0);
+    let ad = dst[3].clamp(0.0, 1.0);
+    let ao = a + ad * (1.0 - a);
+    if ao <= 0.0 {
+        return [0.0; 4];
     }
-    let ndc_x = v[0] / v[3];
-    let ndc_y = v[1] / v[3];
-    let ndc_z = v[2] / v[3];
-    let sx = (ndc_x * 0.5 + 0.5) * width;
-    let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * height;
-    Some([sx, sy, ndc_z])
+    let mut c = [0.0; 4];
+    for k in 0..3 {
+        c[k] = (src[k] * a + dst[k] * ad * (1.0 - a)) / ao;
+    }
+    c[3] = ao;
+    c
 }
 
 // ---------------------------------------------------------------------
-// Per-shading-mode triangle rasterisers (half-space edge functions).
+// Shading.
 // ---------------------------------------------------------------------
 
-/// Flat shading — every covered pixel takes the same sRGB colour.
-fn rasterise_triangle_flat(
-    fb: &mut Framebuffer,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    colour: [u8; 4],
-) {
-    let area = edge(a, b, c);
-    if area.abs() < 1.0e-6 {
-        return;
-    }
-    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
-    let area_inv = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * area_inv;
-            let w1 = edge(c, a, p) * area_inv;
-            let w2 = edge(a, b, p) * area_inv;
-            let inside =
-                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            fb.set_pixel(x, y, z, colour);
+/// Barycentric screen derivatives of a fragment.
+struct Grads {
+    dx: [f32; 3],
+    dy: [f32; 3],
+}
+
+impl Grads {
+    fn of(t: &ScreenTri, b: [f32; 3], x: i32, y: i32) -> Self {
+        let bx = t.bary_at(x as f32 + 1.5, y as f32 + 0.5);
+        let by = t.bary_at(x as f32 + 0.5, y as f32 + 1.5);
+        Self {
+            dx: [bx[0] - b[0], bx[1] - b[1], bx[2] - b[2]],
+            dy: [by[0] - b[0], by[1] - b[1], by[2] - b[2]],
         }
     }
 }
 
-/// Gouraud shading — bilinearly interpolate the per-vertex (already
-/// lit) colour across the triangle.
-fn rasterise_triangle_gouraud(
-    fb: &mut Framebuffer,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    ca: [f32; 4],
-    cb: [f32; 4],
-    cc: [f32; 4],
-) {
-    let area = edge(a, b, c);
-    if area.abs() < 1.0e-6 {
-        return;
-    }
-    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
-    let area_inv = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * area_inv;
-            let w1 = edge(c, a, p) * area_inv;
-            let w2 = edge(a, b, p) * area_inv;
-            let inside =
-                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let r = w0 * ca[0] + w1 * cb[0] + w2 * cc[0];
-            let g = w0 * ca[1] + w1 * cb[1] + w2 * cc[1];
-            let bl = w0 * ca[2] + w1 * cb[2] + w2 * cc[2];
-            let al = w0 * ca[3] + w1 * cb[3] + w2 * cc[3];
-            let pix = linear_rgba_to_srgb_u8([r, g, bl, al]);
-            fb.set_pixel(x, y, z, pix);
-        }
-    }
+fn interp3(v: &[[f32; 3]], base: usize, b: [f32; 3]) -> [f32; 3] {
+    let (a, c, d) = (v[base], v[base + 1], v[base + 2]);
+    [
+        a[0] * b[0] + c[0] * b[1] + d[0] * b[2],
+        a[1] * b[0] + c[1] * b[1] + d[1] * b[2],
+        a[2] * b[0] + c[2] * b[1] + d[2] * b[2],
+    ]
 }
 
-/// Phong shading — interpolate the per-vertex normal across the
-/// triangle, evaluate the lighting equation at every pixel.
-#[allow(clippy::too_many_arguments)]
-fn rasterise_triangle_phong(
-    fb: &mut Framebuffer,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    na: [f32; 3],
-    nb: [f32; 3],
-    nc: [f32; 3],
-    colour_linear: [f32; 4],
-    light: &DirLight,
-) {
-    let area = edge(a, b, c);
-    if area.abs() < 1.0e-6 {
-        return;
-    }
-    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
-    let area_inv = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * area_inv;
-            let w1 = edge(c, a, p) * area_inv;
-            let w2 = edge(a, b, p) * area_inv;
-            let inside =
-                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0];
-            let ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1];
-            let nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2];
-            let normal = vec3_normalise([nx, ny, nz]);
-            let lit = shade_pixel(colour_linear, normal, light);
-            fb.set_pixel(x, y, z, linear_rgba_to_srgb_u8(lit));
-        }
-    }
+fn interp2(v: &[[f32; 2]], base: usize, b: [f32; 3]) -> [f32; 2] {
+    let (a, c, d) = (v[base], v[base + 1], v[base + 2]);
+    [
+        a[0] * b[0] + c[0] * b[1] + d[0] * b[2],
+        a[1] * b[0] + c[1] * b[1] + d[1] * b[2],
+    ]
 }
 
-/// NormalDebug — interpolate the per-vertex normal across the triangle
-/// and write `(n + 1) / 2 * 255` per channel. Matches the classic
-/// "normal map" colour-key. Lighting / material settings ignored.
-fn rasterise_triangle_normal_debug(
-    fb: &mut Framebuffer,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-    na: [f32; 3],
-    nb: [f32; 3],
-    nc: [f32; 3],
-) {
-    let area = edge(a, b, c);
-    if area.abs() < 1.0e-6 {
-        return;
+fn interp4(v: &[[f32; 4]], base: usize, b: [f32; 3]) -> [f32; 4] {
+    let (a, c, d) = (v[base], v[base + 1], v[base + 2]);
+    let mut o = [0.0; 4];
+    for k in 0..4 {
+        o[k] = a[k] * b[0] + c[k] * b[1] + d[k] * b[2];
     }
-    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
-    let area_inv = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * area_inv;
-            let w1 = edge(c, a, p) * area_inv;
-            let w2 = edge(a, b, p) * area_inv;
-            let inside =
-                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let nx = w0 * na[0] + w1 * nb[0] + w2 * nc[0];
-            let ny = w0 * na[1] + w1 * nb[1] + w2 * nc[1];
-            let nz = w0 * na[2] + w1 * nb[2] + w2 * nc[2];
-            let n = vec3_normalise([nx, ny, nz]);
-            let pix = [
-                normal_to_byte(n[0]),
-                normal_to_byte(n[1]),
-                normal_to_byte(n[2]),
-                255,
+    o
+}
+
+struct ShadeCtx<'a> {
+    prepared: &'a PreparedScene,
+    camera: &'a Camera,
+    mode: ShadingMode,
+    legacy_light: DirLight,
+    ambient: f32,
+    tri_refs: &'a [TriRef],
+    shadows: Vec<Option<ShadowMap>>,
+}
+
+impl<'a> ShadeCtx<'a> {
+    /// Copy of the context (shadow maps are shared `Arc` data).
+    fn clone_ctx(&self) -> ShadeCtx<'_> {
+        ShadeCtx {
+            prepared: self.prepared,
+            camera: self.camera,
+            mode: self.mode,
+            legacy_light: self.legacy_light,
+            ambient: self.ambient,
+            tri_refs: self.tri_refs,
+            shadows: self.shadows.clone(),
+        }
+    }
+
+    fn sample_tex(
+        &self,
+        item: &DrawItem,
+        binding: &TextureBinding,
+        base: usize,
+        b: [f32; 3],
+        g: &Grads,
+        space: ColorSpace,
+    ) -> Option<[f32; 4]> {
+        let tex = self.prepared.texture(binding)?;
+        let uvs = item.uv_set(binding.uv_set)?;
+        let uv = interp2(uvs, base, b);
+        let duv = |d: [f32; 3]| -> [f32; 2] {
+            let raw = [uv[0] + 0.0, uv[1] + 0.0];
+            let moved = [
+                raw[0] + uvs[base][0] * d[0] + uvs[base + 1][0] * d[1] + uvs[base + 2][0] * d[2],
+                raw[1] + uvs[base][1] * d[0] + uvs[base + 1][1] * d[1] + uvs[base + 2][1] * d[2],
             ];
-            fb.set_pixel(x, y, z, pix);
+            let a = binding.transform_uv(raw);
+            let m = binding.transform_uv(moved);
+            [m[0] - a[0], m[1] - a[1]]
+        };
+        let dx = duv(g.dx);
+        let dy = duv(g.dy);
+        Some(tex.sample_grad(binding.transform_uv(uv), dx, dy, space))
+    }
+
+    /// `baseColor` (factor × texture × vertex colour), linear RGBA.
+    fn base_color(
+        &self,
+        item: &DrawItem,
+        mat: &PreparedMaterial,
+        base: usize,
+        b: [f32; 3],
+        g: &Grads,
+    ) -> [f32; 4] {
+        let mut c = mat.base_color;
+        if let Some(bind) = &mat.base_color_texture {
+            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb) {
+                for k in 0..4 {
+                    c[k] *= t[k];
+                }
+            }
         }
+        if !item.colors.is_empty() {
+            let v = interp4(&item.colors, base, b);
+            for k in 0..4 {
+                c[k] *= v[k];
+            }
+        }
+        c
+    }
+
+    fn alpha(
+        &self,
+        item: &DrawItem,
+        mat: &PreparedMaterial,
+        base: usize,
+        b: [f32; 3],
+        g: &Grads,
+    ) -> f32 {
+        self.base_color(item, mat, base, b, g)[3]
+    }
+
+    fn shade_line(&self, r: LineRef, t: f32) -> [f32; 4] {
+        let item = &self.prepared.items[r.item as usize];
+        let mat = &self.prepared.materials[item.material];
+        let mut c = mat.base_color;
+        if self.mode == ShadingMode::Pbr && !item.colors.is_empty() {
+            let (a, b) = (item.colors[r.a as usize], item.colors[r.b as usize]);
+            for k in 0..4 {
+                c[k] *= a[k] + (b[k] - a[k]) * t;
+            }
+        }
+        c
+    }
+
+    fn shade_tri(&self, st: &ScreenTri, v: &VisPixel, x: i32, y: i32) -> [f32; 4] {
+        let r = self.tri_refs[st.prim as usize];
+        let item = &self.prepared.items[r.item as usize];
+        let mat = &self.prepared.materials[item.material];
+        let base = 3 * r.tri as usize;
+        let b = v.b;
+        match self.mode {
+            ShadingMode::Flat | ShadingMode::Wireframe => mat.base_color,
+            ShadingMode::Gouraud => {
+                let n = &item.normals;
+                let ca = shade_pixel(mat.base_color, n[base], &self.legacy_light);
+                let cb = shade_pixel(mat.base_color, n[base + 1], &self.legacy_light);
+                let cc = shade_pixel(mat.base_color, n[base + 2], &self.legacy_light);
+                let mut o = [0.0; 4];
+                for k in 0..4 {
+                    o[k] = ca[k] * b[0] + cb[k] * b[1] + cc[k] * b[2];
+                }
+                o
+            }
+            ShadingMode::Phong => {
+                let n = vec3_normalise(interp3(&item.normals, base, b));
+                shade_pixel(mat.base_color, n, &self.legacy_light)
+            }
+            ShadingMode::NormalDebug => {
+                let n = vec3_normalise(interp3(&item.normals, base, b));
+                let lut = srgb_u8_lut();
+                [
+                    lut[normal_to_byte(n[0]) as usize],
+                    lut[normal_to_byte(n[1]) as usize],
+                    lut[normal_to_byte(n[2]) as usize],
+                    1.0,
+                ]
+            }
+            ShadingMode::DepthDebug => {
+                let g = srgb_u8_lut()[depth_to_byte(v.depth) as usize];
+                [g, g, g, 1.0]
+            }
+            _ => {
+                let g = Grads::of(st, b, x, y);
+                self.shade_pbr(item, mat, base, b, &g, st.front)
+            }
+        }
+    }
+
+    fn view_dir(&self, p: [f32; 3]) -> [f32; 3] {
+        match self.camera.projection {
+            Projection::Orthographic => [
+                -self.camera.forward[0],
+                -self.camera.forward[1],
+                -self.camera.forward[2],
+            ],
+            _ => vec3_normalise(vec3_sub(self.camera.eye, p)),
+        }
+    }
+
+    fn shade_pbr(
+        &self,
+        item: &DrawItem,
+        mat: &PreparedMaterial,
+        base: usize,
+        b: [f32; 3],
+        g: &Grads,
+        front: bool,
+    ) -> [f32; 4] {
+        let col = self.base_color(item, mat, base, b, g);
+        let alpha = match mat.alpha_mode {
+            AlphaMode::Blend => col[3].clamp(0.0, 1.0),
+            _ => 1.0,
+        };
+        if mat.unlit {
+            return [col[0], col[1], col[2], alpha];
+        }
+        let p = interp3(&item.positions, base, b);
+        let pos = &item.positions;
+        let mut ng = vec3_normalise(vec3_cross(
+            vec3_sub(pos[base + 1], pos[base]),
+            vec3_sub(pos[base + 2], pos[base]),
+        ));
+        let mut n = if item.has_vertex_normals {
+            let n = vec3_normalise(interp3(&item.normals, base, b));
+            if vec3_dot(n, n) > 0.5 {
+                n
+            } else {
+                ng
+            }
+        } else {
+            ng
+        };
+        if !front {
+            n = [-n[0], -n[1], -n[2]];
+            ng = [-ng[0], -ng[1], -ng[2]];
+        }
+        let v = self.view_dir(p);
+
+        // Metallic / roughness.
+        let mut metallic = mat.metallic;
+        let mut roughness = mat.roughness;
+        if let Some(bind) = &mat.metallic_roughness_texture {
+            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
+                roughness *= t[1];
+                metallic *= t[2];
+            }
+        }
+
+        // Normal map (glTF §3.9.3: tangent-space, +Y up in UV space).
+        if let Some(bind) = &mat.normal_texture {
+            if !item.tangents.is_empty() {
+                if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
+                    let tg = interp4(&item.tangents, base, b);
+                    let w = if item.tangents[base][3] < 0.0 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let t3 = [tg[0], tg[1], tg[2]];
+                    let d = vec3_dot(n, t3);
+                    let tt = vec3_normalise([t3[0] - n[0] * d, t3[1] - n[1] * d, t3[2] - n[2] * d]);
+                    if vec3_dot(tt, tt) > 0.5 {
+                        let bt = vec3_cross(n, tt);
+                        let bt = [bt[0] * w, bt[1] * w, bt[2] * w];
+                        let s = mat.normal_scale;
+                        let ts = [
+                            (t[0] * 2.0 - 1.0) * s,
+                            (t[1] * 2.0 - 1.0) * s,
+                            t[2] * 2.0 - 1.0,
+                        ];
+                        let nn = vec3_normalise([
+                            tt[0] * ts[0] + bt[0] * ts[1] + n[0] * ts[2],
+                            tt[1] * ts[0] + bt[1] * ts[1] + n[1] * ts[2],
+                            tt[2] * ts[0] + bt[2] * ts[1] + n[2] * ts[2],
+                        ]);
+                        if vec3_dot(nn, nn) > 0.5 {
+                            n = nn;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ao = 1.0;
+        if let Some(bind) = &mat.occlusion_texture {
+            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
+                ao = 1.0 + mat.occlusion_strength * (t[0] - 1.0);
+            }
+        }
+        let mut emissive = mat.emissive;
+        if let Some(bind) = &mat.emissive_texture {
+            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb) {
+                for k in 0..3 {
+                    emissive[k] *= t[k];
+                }
+            }
+        }
+
+        let params = BrdfParams::metallic_roughness(
+            [col[0], col[1], col[2]],
+            metallic,
+            roughness,
+            mat.dielectric_f0(),
+        );
+        let mut out = [0.0f32; 3];
+        for k in 0..3 {
+            out[k] = emissive[k] + self.ambient * ao * (params.c_diff[k] + params.f0[k]);
+        }
+        for (li, light) in self.prepared.lights.iter().enumerate() {
+            let Some(s) = light.sample(p) else { continue };
+            let f = brdf::eval(&params, n, v, s.l);
+            if f == [0.0; 3] {
+                continue;
+            }
+            let vis = match self.shadows.get(li) {
+                Some(Some(sm)) => sm.visibility(p, ng, s.l),
+                _ => 1.0,
+            };
+            for k in 0..3 {
+                out[k] += f[k] * s.radiance[k] * vis;
+            }
+        }
+        [out[0], out[1], out[2], alpha]
     }
 }
 
 /// Map a single normal component in `[-1, 1]` into a `u8` colour
-/// channel via `(n + 1) / 2 * 255`. NaNs and zero-length normals fall
-/// back to `128` (the encoded zero).
+/// channel via `(n + 1) / 2 * 255`. NaNs fall back to `128` (the
+/// encoded zero).
 pub(crate) fn normal_to_byte(n: f32) -> u8 {
     if !n.is_finite() {
         return 128;
     }
     let v = ((n.clamp(-1.0, 1.0) + 1.0) * 0.5 * 255.0).round();
     v.clamp(0.0, 255.0) as u8
-}
-
-/// DepthDebug — paint each pixel a grayscale value derived from the
-/// interpolated NDC z. Near (-1) → white (255), far (+1) → black (0).
-fn rasterise_triangle_depth_debug(fb: &mut Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
-    let area = edge(a, b, c);
-    if area.abs() < 1.0e-6 {
-        return;
-    }
-    let (min_x, min_y, max_x, max_y) = tri_bbox(fb, a, b, c);
-    let area_inv = 1.0 / area;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = [x as f32 + 0.5, y as f32 + 0.5, 0.0];
-            let w0 = edge(b, c, p) * area_inv;
-            let w1 = edge(c, a, p) * area_inv;
-            let w2 = edge(a, b, p) * area_inv;
-            let inside =
-                (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let z = w0 * a[2] + w1 * b[2] + w2 * c[2];
-            let g = depth_to_byte(z);
-            fb.set_pixel(x, y, z, [g, g, g, 255]);
-        }
-    }
 }
 
 /// Map an NDC z value (`[-1, 1]`, near = -1) to a grayscale byte where
@@ -613,108 +847,215 @@ pub(crate) fn depth_to_byte(z: f32) -> u8 {
     v.clamp(0.0, 255.0) as u8
 }
 
-fn tri_bbox(fb: &Framebuffer, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> (i32, i32, i32, i32) {
-    let min_x = a[0].min(b[0]).min(c[0]).max(0.0).floor() as i32;
-    let min_y = a[1].min(b[1]).min(c[1]).max(0.0).floor() as i32;
-    let max_x = a[0].max(b[0]).max(c[0]).min(fb.width as f32 - 1.0).ceil() as i32;
-    let max_y = a[1].max(b[1]).max(c[1]).min(fb.height as f32 - 1.0).ceil() as i32;
-    (min_x, min_y, max_x, max_y)
+// ---------------------------------------------------------------------
+// Shadow maps.
+// ---------------------------------------------------------------------
+
+/// Depth map of one light: linear depth along the light direction per
+/// texel (`INFINITY` = nothing).
+#[derive(Debug, Clone)]
+struct ShadowMap {
+    view_proj: [[f32; 4]; 4],
+    size: u32,
+    depth: std::sync::Arc<Vec<f32>>,
+    eye: [f32; 3],
+    dir: [f32; 3],
+    /// World size of one texel: constant (ortho) or per unit distance
+    /// (perspective).
+    texel: f32,
+    perspective: bool,
 }
 
-/// Bresenham line on a screen-space pair of projected vertices. Used
-/// by [`ShadingMode::Wireframe`] and the `Lines*` topologies.
-fn draw_line(fb: &mut Framebuffer, a: [f32; 3], b: [f32; 3], colour: [u8; 4]) {
-    let mut x0 = a[0].round() as i32;
-    let mut y0 = a[1].round() as i32;
-    let x1 = b[0].round() as i32;
-    let y1 = b[1].round() as i32;
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    let len = ((dx as f32).hypot(dy as f32)).max(1.0);
-    let dz = b[2] - a[2];
-    loop {
-        let t =
-            (((x0 - a[0].round() as i32) as f32).hypot((y0 - a[1].round() as i32) as f32)) / len;
-        let z = a[2] + dz * t;
-        fb.set_pixel(x0, y0, z, colour);
-        if x0 == x1 && y0 == y1 {
-            break;
+impl ShadowMap {
+    /// Fraction of the light reaching `p` (geometric normal `ng`,
+    /// direction to the light `l`): 3×3 bilinear PCF.
+    fn visibility(&self, p: [f32; 3], ng: [f32; 3], l: [f32; 3]) -> f32 {
+        let dist = vec3_dot(vec3_sub(p, self.eye), self.dir);
+        let texel = if self.perspective {
+            self.texel * dist.max(1.0e-4)
+        } else {
+            self.texel
+        };
+        // Normal offset toward the lit side, scaled by grazing angle.
+        let ng = if vec3_dot(ng, l) < 0.0 {
+            [-ng[0], -ng[1], -ng[2]]
+        } else {
+            ng
+        };
+        let cos = vec3_dot(ng, l).clamp(0.0, 1.0);
+        let off = texel * (1.0 + 2.0 * (1.0 - cos));
+        let q = [p[0] + ng[0] * off, p[1] + ng[1] * off, p[2] + ng[2] * off];
+        let c = mat4_mul_vec4(&self.view_proj, [q[0], q[1], q[2], 1.0]);
+        if c[3] <= 0.0 {
+            return 1.0;
         }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
+        let s = self.size as f32;
+        let u = (c[0] / c[3] * 0.5 + 0.5) * s - 0.5;
+        let v = (1.0 - (c[1] / c[3] * 0.5 + 0.5)) * s - 0.5;
+        if !(u > -1.0 && v > -1.0 && u < s && v < s) {
+            return 1.0;
         }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
+        let d_recv = vec3_dot(vec3_sub(q, self.eye), self.dir) - texel;
+        let lit = |x: i64, y: i64| -> f32 {
+            if x < 0 || y < 0 || x >= self.size as i64 || y >= self.size as i64 {
+                return 1.0;
+            }
+            if self.depth[y as usize * self.size as usize + x as usize] >= d_recv {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let mut sum = 0.0;
+        for oy in -1..=1 {
+            for ox in -1..=1 {
+                let (fu, fv) = (u + ox as f32, v + oy as f32);
+                let (x0, y0) = (fu.floor(), fv.floor());
+                let (tx, ty) = (fu - x0, fv - y0);
+                let (x0, y0) = (x0 as i64, y0 as i64);
+                let a = lit(x0, y0) * (1.0 - tx) + lit(x0 + 1, y0) * tx;
+                let b = lit(x0, y0 + 1) * (1.0 - tx) + lit(x0 + 1, y0 + 1) * tx;
+                sum += a * (1.0 - ty) + b * ty;
+            }
         }
+        sum / 9.0
     }
 }
 
-#[inline]
-fn edge(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+fn build_shadow_maps(prepared: &PreparedScene, size: u32) -> Vec<Option<ShadowMap>> {
+    prepared
+        .lights
+        .iter()
+        .map(|l| build_shadow_map(prepared, l, size))
+        .collect()
 }
 
-// ---------------------------------------------------------------------
-// Framebuffer.
-// ---------------------------------------------------------------------
+fn build_shadow_map(
+    prepared: &PreparedScene,
+    light: &PreparedLight,
+    size: u32,
+) -> Option<ShadowMap> {
+    if light.kind == LightKind::Point {
+        return None;
+    }
+    let (mn, mx) = prepared.bounds()?;
+    let c = [
+        (mn[0] + mx[0]) * 0.5,
+        (mn[1] + mx[1]) * 0.5,
+        (mn[2] + mx[2]) * 0.5,
+    ];
+    let r = (vec3_dot(vec3_sub(mx, mn), vec3_sub(mx, mn)).sqrt() * 0.5).max(1.0e-3);
+    let dir = vec3_normalise(light.direction);
+    let up = if dir[1].abs() > 0.99 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let (eye, view, proj, texel, perspective_map) = match light.kind {
+        LightKind::Directional => {
+            let eye = [
+                c[0] - dir[0] * 2.0 * r,
+                c[1] - dir[1] * 2.0 * r,
+                c[2] - dir[2] * 2.0 * r,
+            ];
+            let view = look_at(eye, c, up);
+            let proj = orthographic(-r, r, -r, r, r * 0.5, r * 3.5);
+            (eye, view, proj, 2.0 * r / size as f32, false)
+        }
+        _ => {
+            let eye = light.position;
+            let target = [eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2]];
+            let view = look_at(eye, target, up);
+            let fov = (2.0 * light.outer_cone_angle + 0.05).min(170f32.to_radians());
+            let mut far: f32 = 0.0;
+            for i in 0..8 {
+                let k = [
+                    if i & 1 == 0 { mn[0] } else { mx[0] },
+                    if i & 2 == 0 { mn[1] } else { mx[1] },
+                    if i & 4 == 0 { mn[2] } else { mx[2] },
+                ];
+                far = far.max(vec3_dot(vec3_sub(k, eye), vec3_sub(k, eye)).sqrt());
+            }
+            let near = (r * 1.0e-3).max(1.0e-4);
+            let far = (far * 1.01).max(near * 4.0);
+            let proj = perspective(fov, 1.0, near, far);
+            (eye, view, proj, 2.0 * (fov * 0.5).tan() / size as f32, true)
+        }
+    };
+    let view_proj = mat4_mul(proj, view);
 
-struct Framebuffer {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-    zbuf: Vec<f32>,
+    // Casters: opaque + masked triangles (BLEND surfaces cast no
+    // shadow), both faces.
+    let mut refs: Vec<TriRef> = Vec::new();
+    let mut tris = Vec::new();
+    for (ii, item) in prepared.items.iter().enumerate() {
+        if item.topology != DrawTopology::Triangles {
+            continue;
+        }
+        let mat = &prepared.materials[item.material];
+        if mat.alpha_mode == AlphaMode::Blend {
+            continue;
+        }
+        let masked = matches!(mat.alpha_mode, AlphaMode::Mask { .. });
+        for (t, v) in item.positions.chunks_exact(3).enumerate() {
+            let id = refs.len() as u32;
+            refs.push(TriRef {
+                item: ii as u32,
+                tri: t as u32,
+            });
+            let cl = |p: [f32; 3]| mat4_mul_vec4(&view_proj, [p[0], p[1], p[2], 1.0]);
+            setup_triangle(
+                [cl(v[0]), cl(v[1]), cl(v[2])],
+                id,
+                Cull::None,
+                masked,
+                size,
+                size,
+                &mut tris,
+            );
+        }
+    }
+    let ctx = ShadeCtx {
+        prepared,
+        camera: &Camera::frame_bounds(1, 1, mn, mx, &RenderOptions::default()),
+        mode: ShadingMode::Pbr,
+        legacy_light: build_light(crate::options::LightSpec::default_light()),
+        ambient: 0.0,
+        tri_refs: &refs,
+        shadows: Vec::new(),
+    };
+    let mask_test = |t: &ScreenTri, b: [f32; 3], x: i32, y: i32| -> bool {
+        let r = refs[t.prim as usize];
+        let item = &prepared.items[r.item as usize];
+        let mat = &prepared.materials[item.material];
+        let AlphaMode::Mask { cutoff } = mat.alpha_mode else {
+            return true;
+        };
+        ctx.alpha(item, mat, 3 * r.tri as usize, b, &Grads::of(t, b, x, y)) >= cutoff
+    };
+    let vis = raster_visibility(&tris, &[], size, size, &mask_test);
+    let depth: Vec<f32> = vis
+        .iter()
+        .map(|v| {
+            if v.id == NONE {
+                return f32::INFINITY;
+            }
+            let r = refs[tris[v.id as usize].prim as usize];
+            let item = &prepared.items[r.item as usize];
+            let p = interp3(&item.positions, 3 * r.tri as usize, v.b);
+            vec3_dot(vec3_sub(p, eye), dir)
+        })
+        .collect();
+    Some(ShadowMap {
+        view_proj,
+        size,
+        depth: std::sync::Arc::new(depth),
+        eye,
+        dir,
+        texel,
+        perspective: perspective_map,
+    })
 }
-
-impl Framebuffer {
-    fn new(width: u32, height: u32, background: [u8; 4]) -> Self {
-        let n = (width as usize) * (height as usize);
-        let mut rgba = Vec::with_capacity(n * 4);
-        for _ in 0..n {
-            rgba.extend_from_slice(&background);
-        }
-        Self {
-            width,
-            height,
-            rgba,
-            zbuf: vec![f32::INFINITY; n],
-        }
-    }
-
-    fn set_pixel(&mut self, x: i32, y: i32, z: f32, colour: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return;
-        }
-        let idx = (y as usize) * (self.width as usize) + (x as usize);
-        if z < self.zbuf[idx] {
-            self.zbuf[idx] = z;
-            let p = idx * 4;
-            self.rgba[p] = colour[0];
-            self.rgba[p + 1] = colour[1];
-            self.rgba[p + 2] = colour[2];
-            self.rgba[p + 3] = colour[3];
-        }
-    }
-
-    fn into_image(self) -> RgbaImage {
-        RgbaImage {
-            width: self.width,
-            height: self.height,
-            stride: (self.width as usize) * 4,
-            pixels: self.rgba,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------
-// Tests — round-tripped from cli-convert's mesh3d_render tests with
-// adapted option types.
-// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

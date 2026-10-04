@@ -59,6 +59,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod brdf;
 pub mod camera;
 pub mod error;
 pub mod hdr;
@@ -66,6 +67,7 @@ pub mod image;
 mod math;
 pub mod options;
 pub mod prepare;
+mod raster;
 mod raycast;
 pub mod registry;
 mod scanline;
@@ -145,23 +147,38 @@ pub fn make_renderer(backend: RenderBackend) -> Result<Box<dyn Renderer>> {
     }
 }
 
-/// Scanline rasteriser — half-space edge-function pipeline with a
-/// per-pixel z-buffer. Cheap, pure-Rust, no global illumination, no
-/// raytraced shadows. See [`scanline`] for the algorithmic detail.
+/// Scanline rasteriser — clipped, perspective-correct half-space
+/// edge-function pipeline with a visibility buffer, tile-parallel
+/// over horizontal bands. See [`RenderBackend::Scanline`] for the
+/// capability envelope.
 ///
-/// Constructed via [`make_renderer`] (recommended) or directly when
-/// the caller wants to keep the renderer around across many frames.
+/// Constructed via [`make_renderer`] (recommended) or directly. The
+/// renderer owns a [`TextureCache`], so textures decode once across
+/// frames; supply a decoder with
+/// [`ScanlineRenderer::with_texture_resolver`] (the default resolver
+/// only understands [`texture::RAW_RGBA8_MIME`]).
 #[derive(Debug, Default)]
 pub struct ScanlineRenderer {
-    _priv: (),
+    cache: TextureCache,
 }
 
 impl ScanlineRenderer {
-    /// Construct a fresh scanline renderer. State-free today — the
-    /// rasteriser allocates a per-frame framebuffer + z-buffer inside
-    /// `render`, so multiple `render` calls don't share memory.
+    /// Construct a scanline renderer with no image decoder.
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self::default()
+    }
+
+    /// Construct a scanline renderer decoding textures through
+    /// `resolver`.
+    pub fn with_texture_resolver(resolver: std::sync::Arc<dyn TextureResolver>) -> Self {
+        Self {
+            cache: TextureCache::new(resolver),
+        }
+    }
+
+    /// The renderer's texture cache.
+    pub fn texture_cache_mut(&mut self) -> &mut TextureCache {
+        &mut self.cache
     }
 }
 
@@ -171,7 +188,19 @@ impl Renderer for ScanlineRenderer {
         scene: &oxideav_mesh3d::Scene3D,
         opts: &RenderOptions,
     ) -> Result<RgbaImage> {
-        Ok(scanline::render_scene(scene, opts))
+        Ok(scanline::render_with_cache(scene, opts, &mut self.cache))
+    }
+
+    fn render_hdr(
+        &mut self,
+        scene: &oxideav_mesh3d::Scene3D,
+        opts: &RenderOptions,
+    ) -> Result<HdrImage> {
+        Ok(scanline::render_hdr_with_cache(
+            scene,
+            opts,
+            &mut self.cache,
+        ))
     }
 }
 
