@@ -202,6 +202,9 @@
 //!
 //! Inside a volume (back face of a material with thickness > 0) the
 //! sheen and clearcoat layers are disabled.
+//! The occlusion texture is ignored: the path tracer computes
+//! occlusion itself (glTF §3.9.4 defines it as a hint for indirect
+//! lighting approximations).
 //!
 //! **Lobe selection** (from `v` only, `c_v = n·v`):
 //! `F̄_d = s·max(F_d at c_v)`, `F̄_m = mean(Schlick(baseColor, c_v))`,
@@ -2084,72 +2087,110 @@ impl PathTracer {
         }
     }
 
-    fn resolve(&self, map: impl Fn([f32; 3]) -> [f32; 3]) -> (u32, u32, Vec<[f32; 4]>) {
-        let (w, h) = self
-            .state
+    fn dims(&self) -> (u32, u32) {
+        self.state
             .as_ref()
             .map(|s| (s.width, s.height))
-            .unwrap_or((self.opts.width.max(1), self.opts.height.max(1)));
-        let bg = self.bg_linear();
-        let n = self.samples.max(1) as f64;
-        let px = if self.accum.len() == w as usize * h as usize && self.samples > 0 {
-            self.accum
-                .iter()
-                .map(|a| {
-                    if a[3] <= 0.0 {
-                        return bg;
-                    }
-                    let m = [
-                        (a[0] / a[3]) as f32,
-                        (a[1] / a[3]) as f32,
-                        (a[2] / a[3]) as f32,
-                    ];
-                    let f = (a[3] / n).clamp(0.0, 1.0) as f32;
-                    if f >= 1.0 {
-                        let c = map(m);
-                        return [c[0], c[1], c[2], 1.0];
-                    }
-                    Self::mix(map(m), f, bg)
-                })
-                .collect()
+            .unwrap_or((self.opts.width.max(1), self.opts.height.max(1)))
+    }
+
+    /// Resolve pixel `a` (accumulator entry) — `None` when no sample
+    /// covered it (background).
+    fn resolve_pixel(
+        &self,
+        a: &[f64; 4],
+        bg: [f32; 4],
+        map: &impl Fn([f32; 3]) -> [f32; 3],
+    ) -> Option<[f32; 4]> {
+        if a[3] <= 0.0 || self.samples == 0 {
+            return None;
+        }
+        let m = [
+            (a[0] / a[3]) as f32,
+            (a[1] / a[3]) as f32,
+            (a[2] / a[3]) as f32,
+        ];
+        let f = (a[3] / self.samples as f64).clamp(0.0, 1.0) as f32;
+        let c = map(m);
+        Some(if f >= 1.0 {
+            [c[0], c[1], c[2], 1.0]
         } else {
-            vec![bg; w as usize * h as usize]
-        };
-        (w, h, px)
+            Self::mix(c, f, bg)
+        })
+    }
+
+    /// Fill `out` (one entry per pixel) in parallel: `f(pixel, slot)`.
+    fn par_pixels<T: Send>(out: &mut [T], f: impl Fn(usize, &mut T) + Sync) {
+        let n = out.len();
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1)
+            .min(n / 16_384 + 1)
+            .max(1);
+        if threads <= 1 {
+            for (i, o) in out.iter_mut().enumerate() {
+                f(i, o);
+            }
+            return;
+        }
+        let chunk = n.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, part) in out.chunks_mut(chunk).enumerate() {
+                let f = &f;
+                sc.spawn(move || {
+                    for (i, o) in part.iter_mut().enumerate() {
+                        f(ci * chunk + i, o);
+                    }
+                });
+            }
+        });
     }
 
     /// Current estimate as display bytes (exposure, tone map, sRGB;
-    /// uncovered pixels keep the background bytes exactly).
+    /// uncovered pixels keep the background bytes exactly). Resolved
+    /// in parallel; cheap enough to call every UI frame.
     pub fn image(&self) -> RgbaImage {
+        let (w, h) = self.dims();
         let (tm, ex) = (self.opts.tone_map, self.opts.exposure);
-        let bg = self.opts.background.0;
-        let (w, h, px) = self.resolve(|c| tm.apply(scale(c, ex)));
-        let mut pixels = Vec::with_capacity(px.len() * 4);
-        for (i, c) in px.iter().enumerate() {
-            let uncovered = !matches!(self.accum.get(i), Some(a) if a[3] > 0.0);
-            if uncovered {
-                pixels.extend_from_slice(&bg);
-            } else {
-                pixels.extend_from_slice(&[
-                    linear_to_srgb_byte(c[0]),
-                    linear_to_srgb_byte(c[1]),
-                    linear_to_srgb_byte(c[2]),
-                    (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-                ]);
-            }
+        let bg_bytes = self.opts.background.0;
+        let bg = self.bg_linear();
+        let map = |c: [f32; 3]| tm.apply(scale(c, ex));
+        let n = w as usize * h as usize;
+        let mut px = vec![bg_bytes; n];
+        if self.accum.len() == n {
+            Self::par_pixels(&mut px, |i, o| {
+                if let Some(c) = self.resolve_pixel(&self.accum[i], bg, &map) {
+                    *o = [
+                        linear_to_srgb_byte(c[0]),
+                        linear_to_srgb_byte(c[1]),
+                        linear_to_srgb_byte(c[2]),
+                        (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ];
+                }
+            });
         }
         RgbaImage {
             width: w,
             height: h,
             stride: w as usize * 4,
-            pixels,
+            pixels: px.into_iter().flatten().collect(),
         }
     }
 
     /// Current estimate in scene-linear floats (no exposure / tone
     /// map; uncovered pixels hold the decoded background).
     pub fn hdr(&self) -> HdrImage {
-        let (w, h, px) = self.resolve(|c| c);
+        let (w, h) = self.dims();
+        let bg = self.bg_linear();
+        let n = w as usize * h as usize;
+        let mut px = vec![bg; n];
+        if self.accum.len() == n {
+            Self::par_pixels(&mut px, |i, o| {
+                if let Some(c) = self.resolve_pixel(&self.accum[i], bg, &|c| c) {
+                    *o = c;
+                }
+            });
+        }
         HdrImage {
             width: w,
             height: h,

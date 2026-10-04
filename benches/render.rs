@@ -320,6 +320,17 @@ fn pathtrace_benches(c: &mut Criterion) {
             black_box(tracer.image())
         })
     });
+    let hd = RenderOptions {
+        width: 1920,
+        height: 1080,
+        ..cornell64.clone()
+    };
+    let mut hd_tracer = PathTracer::new();
+    hd_tracer.sync(&cornell, &hd);
+    hd_tracer.refine(1);
+    g.bench_function("pathtrace_resolve_image_1080p", |b| {
+        b.iter(|| black_box(hd_tracer.image()))
+    });
     let sphere = sphere_scene(32, 16);
     let sphere16 = RenderOptions {
         path_trace: spp(16),

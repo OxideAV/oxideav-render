@@ -154,13 +154,17 @@ Same machine as the prep-layer table (AMD Ryzen Threadripper 9970X,
 | `pathtrace_cornell_64spp_256` | 281 ms |
 | `pathtrace_cornell_refine1_256` | 8.5 ms |
 | `pathtrace_sphere_960tri_16spp_256` | 154 ms |
+| `pathtrace_resolve_image_1080p` | 7.8 ms |
 
 - **Cornell box, 256², 64 spp, 8 bounces** (`testscenes::cornell_box`,
   point light + 0.2 sky through the open side): 4.2 M camera paths in
   0.28 s, ~15 M paths/s including NEE shadow rays and roulette.
 - **`refine1`** is one progressive pass (1 spp over 256²) plus the
   display resolve — the per-frame cost an interactive viewer pays, so
-  ~100 fps of refinement at this size.
+  ~100 fps of refinement at this size. `resolve_image_1080p` is
+  `PathTracer::image()` alone at 1920×1080 (tone map + sRGB encode of
+  2 M pixels, parallel over all threads) — the fixed per-frame
+  overhead on top of `refine`.
 - The sphere row is slower per sample than the Cornell box despite
   shorter paths: its 960-triangle BVH is ~20× the Cornell box's
   triangle count, and every bounce off the convex sphere traverses it
