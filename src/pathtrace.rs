@@ -159,7 +159,8 @@
 //! `G₂ = 1 / (1 + Λ(v) + Λ(l))`, `Λ(ω) = (√(α² + (1−α²)cos²θ)/cosθ − 1)/2`
 //! (Heitz, "Understanding the Masking-Shadowing Function", JCGT 3(2),
 //! 2014). Frame: `n` is the (normal-mapped) shading normal flipped to
-//! the incoming side; `n_g` the geometric normal likewise; if
+//! the incoming side (for double-sided back faces the interpolated
+//! normal is reversed *before* the normal map applies, glTF §3.9.3); `n_g` the geometric normal likewise; if
 //! `n·v ≤ 0` the shading normal is replaced by `n_g`. A direction is a
 //! *reflection* when `n_g·l > 0`, a *transmission* otherwise.
 //!
@@ -1410,7 +1411,16 @@ impl Integrator<'_> {
             } else {
                 TexLod::Base
             };
-            let mat: MaterialSample = self.ts.material(&hit, &surf, lod);
+            // Double-sided back faces: glTF reverses the normal before
+            // normal mapping (as the scanline backend does). `Bsdf::new`
+            // expects front-side normals and flips them itself, so the
+            // oriented result is negated back here.
+            let flip = !hit.front_face && pmat.double_sided;
+            let mut mat: MaterialSample = self.ts.material_oriented(&hit, &surf, lod, flip);
+            if flip {
+                mat.normal = neg(mat.normal);
+                mat.clearcoat_normal = neg(mat.clearcoat_normal);
+            }
             if mat.unlit {
                 let c = [mat.base_color[0], mat.base_color[1], mat.base_color[2]];
                 let contrib = mul(beta, c);
@@ -2466,14 +2476,39 @@ mod tests {
 
     #[test]
     fn direct_lighting_matches_scanline_pbr() {
-        for (name, scene) in [
-            ("shadow_box", crate::testscenes::shadow_box()),
-            ("sphere_grid", crate::testscenes::sphere_grid(3, 2)),
+        // Double-sided normal-mapped quad seen from behind, lit from
+        // behind: exercises the back-face normal-map orientation.
+        let mut back = crate::testscenes::normal_mapped_quad(0.8);
+        for m in &mut back.materials {
+            m.double_sided = true;
+        }
+        // Only the back light: the front light must not reach the back
+        // face (the scanline shadow map's bias lets it leak through a
+        // single quad when the normal map tilts toward it).
+        for l in &mut back.lights {
+            if let Light::Directional { intensity, .. } = l {
+                *intensity = 0.0;
+            }
+        }
+        crate::testscenes::add_light(
+            &mut back,
+            Light::Directional {
+                color: [1.0; 3],
+                intensity: 2.0,
+            },
+            [0.0; 3],
+            [0.4, -0.3, 1.0],
+        );
+        add_camera(&mut back, [0.3, 0.2, -2.5], [0.0; 3], 0.9);
+        for (name, scene, cam) in [
+            ("shadow_box", crate::testscenes::shadow_box(), 0),
+            ("sphere_grid", crate::testscenes::sphere_grid(3, 2), 0),
+            ("normal_map_back", back, 1),
         ] {
             let base = RenderOptions {
                 width: 48,
                 height: 48,
-                scene_camera: Some(0),
+                scene_camera: Some(cam),
                 ambient: 0.0,
                 shading: ShadingMode::Pbr,
                 shadows: true,
