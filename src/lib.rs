@@ -61,6 +61,7 @@
 
 mod camera;
 pub mod error;
+pub mod hdr;
 pub mod image;
 mod math;
 pub mod options;
@@ -68,12 +69,17 @@ mod raycast;
 pub mod registry;
 mod scanline;
 mod shade;
+pub mod texture;
 
 #[cfg(feature = "registry")]
 pub mod source;
 
 pub use error::{Error, Result};
+pub use hdr::{HdrImage, ToneMap};
 pub use image::RgbaImage;
+#[cfg(feature = "registry")]
+pub use texture::RegistryTextureResolver;
+pub use texture::{NoTextureResolver, TextureCache, TextureResolver};
 pub use options::{
     BackgroundColor, CameraSpec, LightSpec, Projection, RenderBackend, RenderOptions, ShadingMode,
 };
