@@ -113,6 +113,7 @@ pub enum TexLod {
 /// The glTF material inputs evaluated at a surface point. Colours are
 /// linear. Normals are on the CCW-front side of the triangle (callers
 /// flip them for back-face hits).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaterialSample {
     /// Base colour × texture × vertex colour (RGBA).
@@ -157,6 +158,66 @@ pub struct MaterialSample {
     pub sheen_color: [f32; 3],
     /// Sheen perceptual roughness.
     pub sheen_roughness: f32,
+    /// `KHR_materials_anisotropy` strength × texture B, `[0, 1]`
+    /// (0 = isotropic).
+    pub anisotropy: f32,
+    /// World-space unit direction of increased roughness
+    /// (`KHR_materials_anisotropy`: the vertex tangent frame rotated
+    /// by `anisotropyRotation` and the texture's RG direction),
+    /// front side; the zero vector when the item has no tangent
+    /// frame (anisotropy then has no effect).
+    pub anisotropy_direction: [f32; 3],
+    /// `KHR_materials_iridescence` factor × texture R, `[0, 1]`.
+    pub iridescence: f32,
+    /// Thin-film index of refraction (`iridescenceIor`).
+    pub iridescence_ior: f32,
+    /// Thin-film thickness in nanometres (`mix(min, max, texture G)`).
+    pub iridescence_thickness: f32,
+    /// `KHR_materials_diffuse_transmission` factor × texture A,
+    /// `[0, 1]`.
+    pub diffuse_transmission: f32,
+    /// Diffuse-transmission colour (factor × texture RGB).
+    pub diffuse_transmission_color: [f32; 3],
+    /// `KHR_materials_dispersion` (`20 / Abbe number`, 0 = none).
+    pub dispersion: f32,
+}
+
+impl Default for MaterialSample {
+    /// The glTF default material: white, dielectric (IOR 1.5), fully
+    /// rough, opaque, single-sided, `+Z` normal, no extensions.
+    fn default() -> Self {
+        Self {
+            base_color: [1.0; 4],
+            metallic: 1.0,
+            roughness: 1.0,
+            normal: [0.0, 0.0, 1.0],
+            occlusion: 1.0,
+            emissive: [0.0; 3],
+            unlit: false,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
+            ior: 1.5,
+            specular: 1.0,
+            specular_color: [1.0; 3],
+            transmission: 0.0,
+            thickness: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: f32::INFINITY,
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.0,
+            clearcoat_normal: [0.0, 0.0, 1.0],
+            sheen_color: [0.0; 3],
+            sheen_roughness: 0.0,
+            anisotropy: 0.0,
+            anisotropy_direction: [0.0; 3],
+            iridescence: 0.0,
+            iridescence_ior: 1.3,
+            iridescence_thickness: 400.0,
+            diffuse_transmission: 0.0,
+            diffuse_transmission_color: [1.0; 3],
+            dispersion: 0.0,
+        }
+    }
 }
 
 /// A prepared scene plus its world-space triangle BVH.
@@ -492,16 +553,18 @@ impl TraceScene {
     }
 
     /// Apply a tangent-space normal map sampled as `t` to `n`.
-    fn perturb(
+    /// The interpolated vertex tangent frame `(t, b)` at a hit,
+    /// orthonormalised against `n` (the glTF `TANGENT` handedness in
+    /// `w` flips the bitangent). `None` for items without tangents or
+    /// a tangent parallel to `n`.
+    fn tangent_frame(
         item: &DrawItem,
         base: usize,
         b: [f32; 3],
         n: [f32; 3],
-        t: [f32; 4],
-        scale: f32,
-    ) -> [f32; 3] {
+    ) -> Option<([f32; 3], [f32; 3])> {
         if item.tangents.len() != item.positions.len() {
-            return n;
+            return None;
         }
         let tg = interp4(&item.tangents, base, b);
         let w = if item.tangents[base][3] < 0.0 {
@@ -513,10 +576,23 @@ impl TraceScene {
         let d = vec3_dot(n, t3);
         let tt = vec3_normalise([t3[0] - n[0] * d, t3[1] - n[1] * d, t3[2] - n[2] * d]);
         if vec3_dot(tt, tt) < 0.5 {
-            return n;
+            return None;
         }
         let bt = vec3_cross(n, tt);
-        let bt = [bt[0] * w, bt[1] * w, bt[2] * w];
+        Some((tt, [bt[0] * w, bt[1] * w, bt[2] * w]))
+    }
+
+    fn perturb(
+        item: &DrawItem,
+        base: usize,
+        b: [f32; 3],
+        n: [f32; 3],
+        t: [f32; 4],
+        scale: f32,
+    ) -> [f32; 3] {
+        let Some((tt, bt)) = Self::tangent_frame(item, base, b, n) else {
+            return n;
+        };
         let ts = [
             (t[0] * 2.0 - 1.0) * scale,
             (t[1] * 2.0 - 1.0) * scale,
@@ -681,6 +757,62 @@ impl TraceScene {
             }
         }
 
+        let (mut anisotropy, mut anisotropy_direction) = (0.0, [0.0; 3]);
+        if let Some(a) = &ext.anisotropy {
+            anisotropy = fin(a.strength, 0.0).clamp(0.0, 1.0);
+            let mut dir = [1.0f32, 0.0f32];
+            if let Some(t) = ext_samp(&a.texture, ColorSpace::Linear) {
+                dir = [t[0] * 2.0 - 1.0, t[1] * 2.0 - 1.0];
+                anisotropy *= t[2].clamp(0.0, 1.0);
+            }
+            let (sr, cr) = fin(a.rotation, 0.0).sin_cos();
+            let rot = [cr * dir[0] - sr * dir[1], sr * dir[0] + cr * dir[1]];
+            if let Some((tt, bt)) = Self::tangent_frame(item, base, b, sn) {
+                let d = vec3_normalise([
+                    tt[0] * rot[0] + bt[0] * rot[1],
+                    tt[1] * rot[0] + bt[1] * rot[1],
+                    tt[2] * rot[0] + bt[2] * rot[1],
+                ]);
+                if vec3_dot(d, d) > 0.5 {
+                    anisotropy_direction = d;
+                }
+            }
+            if vec3_dot(anisotropy_direction, anisotropy_direction) < 0.5 {
+                anisotropy = 0.0;
+            }
+        }
+        let (mut iridescence, mut iridescence_ior, mut iridescence_thickness) = (0.0, 1.3, 400.0);
+        if let Some(i) = &ext.iridescence {
+            iridescence = fin(i.factor, 0.0).clamp(0.0, 1.0);
+            if let Some(t) = ext_samp(&i.factor_texture, ColorSpace::Linear) {
+                iridescence *= t[0];
+            }
+            iridescence_ior = fin(i.ior, 1.3).max(1.0);
+            let (lo, hi) = (fin(i.thickness_min, 100.0), fin(i.thickness_max, 400.0));
+            let g = ext_samp(&i.thickness_texture, ColorSpace::Linear)
+                .map(|t| t[1].clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            iridescence_thickness = (lo + (hi - lo) * g).max(0.0);
+        }
+        let (mut diffuse_transmission, mut diffuse_transmission_color) = (0.0, [1.0; 3]);
+        if let Some(d) = &ext.diffuse_transmission {
+            diffuse_transmission = fin(d.factor, 0.0).clamp(0.0, 1.0);
+            if let Some(t) = ext_samp(&d.factor_texture, ColorSpace::Linear) {
+                diffuse_transmission *= t[3];
+            }
+            diffuse_transmission_color = [
+                fin(d.color_factor[0], 1.0).clamp(0.0, 1.0),
+                fin(d.color_factor[1], 1.0).clamp(0.0, 1.0),
+                fin(d.color_factor[2], 1.0).clamp(0.0, 1.0),
+            ];
+            if let Some(t) = ext_samp(&d.color_texture, ColorSpace::Srgb) {
+                for k in 0..3 {
+                    diffuse_transmission_color[k] *= t[k];
+                }
+            }
+        }
+        let dispersion = ext.dispersion.map(|v| fin(v, 0.0).max(0.0)).unwrap_or(0.0);
+
         MaterialSample {
             base_color: col,
             metallic: metallic.clamp(0.0, 1.0),
@@ -703,6 +835,14 @@ impl TraceScene {
             clearcoat_normal,
             sheen_color,
             sheen_roughness,
+            anisotropy,
+            anisotropy_direction,
+            iridescence,
+            iridescence_ior,
+            iridescence_thickness,
+            diffuse_transmission,
+            diffuse_transmission_color,
+            dispersion,
         }
     }
 }

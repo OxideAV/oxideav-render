@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Path tracer: the remaining KHR material extensions** — every
+  ratified material extension `oxideav-mesh3d` carries is now shaded:
+  - `KHR_materials_anisotropy`: anisotropic GGX (`α_t = mix(α, 1,
+    strength²)` along the material direction, `α_b = α`) with the
+    matching Smith `Λ` and visible-normal sampling in the direction's
+    frame; direction from the vertex tangent frame × `anisotropyRotation`
+    × the texture's RG, strength × texture B; strength 0 is the
+    isotropic path bit for bit.
+  - `KHR_materials_iridescence`: thin-film Fresnel (`iridescent_fresnel`,
+    Belcour & Barla 2017 as written in the extension) mixed into the
+    dielectric and metal Fresnel terms by the iridescence strength; factor /
+    thickness textures, `iridescenceIor`, `rgb_mix` energy rule.
+  - `KHR_materials_diffuse_transmission`: a Lambertian lobe into the lower
+    hemisphere taking `dt` of the non-specular share (colour factor ×
+    texture), cosine-sampled; `Bsdf::diffuse_transmission_probability`.
+  - `KHR_materials_dispersion`: per-path hero colour channel through
+    dispersive volumes (`dispersion_iors`, `ior ± (ior − 1)·0.025·
+    dispersion`), unbiased one-sample channel estimation.
+  - `MaterialSample` (`#[non_exhaustive]`, now `Default`) carries the new
+    inputs; `trace::TraceScene::material` evaluates them (textures
+    included).
+- `testscenes`: `brushed_metal_plate`, `iridescent_sphere`,
+  `backlit_leaf`, `dispersive_sphere`, `material_extensions` (showcase);
+  `tests/pathtrace_materials.rs` pins the rendered properties (highlight
+  stretch follows the rotation, white light tinted by the film, backlit
+  leaf glows only with diffuse transmission and linearly in it, dispersion
+  fringes with an unchanged mean, determinism + convergence);
+  `pathtrace_materials_16spp_256` bench row; the dump example renders
+  the five scenes. Cost per frame (256², 16 spp): anisotropy +0.6 %,
+  diffuse transmission +1 %, dispersion +3 %, iridescence +9 %;
+  showcase convergence 28.1 / 33.9 / 37.3 dB PSNR at 16 / 64 / 256 spp
+  vs a 1024-spp reference (BENCHMARKS.md).
 - **`ImageTextureResolver`** (`registry` feature): textures and
   environment maps decode through the `oxideav-image` gateway
   (`decode_bytes_with` → `Image`), so every image format registered in

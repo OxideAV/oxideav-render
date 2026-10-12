@@ -731,6 +731,339 @@ pub fn normal_mapped_quad(tilt: f32) -> Scene3D {
 // Metrics.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// KHR material extensions (path tracer).
+// ---------------------------------------------------------------------
+
+/// Brushed-metal plate: a `[-1, 1]²` metallic quad at `y = 0` (normal
+/// `+Y`, tangents along `+X`) with `KHR_materials_anisotropy`
+/// `strength` / `rotation` (radians), roughness 0.35, under a point
+/// light at `(0, 1.5, 0)`; camera above and slightly in front at
+/// `(0, 2, 0.6)`. With `rotation = 0` the highlight stretches along
+/// world `X` (image x), with `π/2` along world `Z` (image y).
+pub fn brushed_metal_plate(strength: f32, rotation: f32) -> Scene3D {
+    use oxideav_mesh3d::material::Anisotropy;
+    let mut scene = Scene3D::new();
+    let mut m = Material::new();
+    m.base_color = [0.9, 0.9, 0.9, 1.0];
+    m.metallic = 1.0;
+    m.roughness = 0.35;
+    m.ext.anisotropy = Some(Anisotropy {
+        strength,
+        rotation,
+        texture: None,
+    });
+    let mat = scene.add_material(m);
+    let mut p = quad(
+        [
+            [-1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 0.0, -1.0],
+            [-1.0, 0.0, -1.0],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(mat);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    add_light(
+        &mut scene,
+        Light::Point {
+            color: [1.0; 3],
+            intensity: 8.0,
+            range: None,
+        },
+        [0.0, 1.5, 0.0],
+        [0.0, -1.0, 0.0],
+    );
+    add_camera(&mut scene, [0.0, 2.0, 0.6], [0.0, 0.0, 0.0], 0.9);
+    scene
+}
+
+/// Dark glossy dielectric unit sphere (base 0.1 grey, roughness 0.25,
+/// so the specular highlight dominates the diffuse term) with
+/// `KHR_materials_iridescence` (`iridescence` strength, film thickness
+/// `thickness_nm`, film IOR 1.3) under a white point light from the
+/// upper front-right; camera on `+Z` at distance 4. Without
+/// iridescence the highlight is grey.
+pub fn iridescent_sphere(iridescence: f32, thickness_nm: f32) -> Scene3D {
+    use oxideav_mesh3d::material::Iridescence;
+    let mut scene = Scene3D::new();
+    let mut m = Material::new();
+    m.base_color = [0.1, 0.1, 0.1, 1.0];
+    m.metallic = 0.0;
+    m.roughness = 0.25;
+    m.ext.iridescence = Some(Iridescence {
+        factor: iridescence,
+        thickness_min: thickness_nm,
+        thickness_max: thickness_nm,
+        ..Iridescence::default()
+    });
+    let mat = scene.add_material(m);
+    let mut p = uv_sphere(1.0, 48, 24);
+    p.material = Some(mat);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    add_light(
+        &mut scene,
+        Light::Point {
+            color: [1.0; 3],
+            intensity: 40.0,
+            range: None,
+        },
+        [2.0, 3.0, 3.0],
+        [-2.0, -3.0, -3.0],
+    );
+    add_camera(&mut scene, [0.0, 0.0, 4.0], [0.0, 0.0, 0.0], 0.7);
+    scene
+}
+
+/// Backlit leaf: a double-sided `[-1, 1]²` quad at `z = 0` facing the
+/// camera on `+Z`, dark green and fully rough, with
+/// `KHR_materials_diffuse_transmission` `diffuse_transmission`
+/// (colour `[0.6, 0.9, 0.4]`); the only light is a point light
+/// *behind* it at `(0, 0, -1.5)`. The front shows nothing without
+/// diffuse transmission.
+pub fn backlit_leaf(diffuse_transmission: f32) -> Scene3D {
+    use oxideav_mesh3d::material::DiffuseTransmission;
+    let mut scene = Scene3D::new();
+    let mut m = Material::new();
+    m.base_color = [0.15, 0.5, 0.1, 1.0];
+    m.metallic = 0.0;
+    m.roughness = 1.0;
+    m.double_sided = true;
+    m.ext.diffuse_transmission = Some(DiffuseTransmission {
+        factor: diffuse_transmission,
+        color_factor: [0.6, 0.9, 0.4],
+        ..DiffuseTransmission::default()
+    });
+    let mat = scene.add_material(m);
+    let mut p = quad(
+        [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(mat);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    add_light(
+        &mut scene,
+        Light::Point {
+            color: [1.0; 3],
+            intensity: 10.0,
+            range: None,
+        },
+        [0.0, 0.0, -1.5],
+        [0.0, 0.0, 1.0],
+    );
+    add_camera(&mut scene, [0.0, 0.0, 3.0], [0.0, 0.0, 0.0], 0.9);
+    scene
+}
+
+/// Smooth glass sphere (radius 0.8, IOR 1.5, `KHR_materials_volume`
+/// thickness 1) with `KHR_materials_dispersion` `dispersion` in front
+/// of an unlit black / white checker backdrop at `z = -2`; camera on
+/// `+Z` at distance 3.5. Dispersion separates the refracted checker
+/// edges into colour fringes without changing the mean brightness.
+pub fn dispersive_sphere(dispersion: f32) -> Scene3D {
+    use oxideav_mesh3d::material::{Transmission, Volume};
+    let mut scene = Scene3D::new();
+    let tex = scene.add_texture(raw_texture(
+        64,
+        64,
+        &checker_rgba8(64, 8, [255, 255, 255, 255], [0, 0, 0, 255]),
+        Sampler::default_sampler(),
+    ));
+    let mut bg = Material::new();
+    bg.base_color_texture = Some(TextureRef::new(tex));
+    bg.ext.unlit = true;
+    let bg = scene.add_material(bg);
+    let mut p = quad(
+        [
+            [-3.0, -3.0, -2.0],
+            [3.0, -3.0, -2.0],
+            [3.0, 3.0, -2.0],
+            [-3.0, 3.0, -2.0],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(bg);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    let mut g = Material::new();
+    g.base_color = [1.0, 1.0, 1.0, 1.0];
+    g.metallic = 0.0;
+    g.roughness = 0.0;
+    g.ext.transmission = Some(Transmission {
+        factor: 1.0,
+        factor_texture: None,
+    });
+    g.ext.volume = Some(Volume {
+        thickness: 1.0,
+        thickness_texture: None,
+        attenuation_distance: None,
+        attenuation_color: [1.0; 3],
+    });
+    g.ext.ior = Some(1.5);
+    g.ext.dispersion = Some(dispersion);
+    let glass = scene.add_material(g);
+    let mut s = uv_sphere(0.8, 48, 24);
+    s.material = Some(glass);
+    add_mesh_node(&mut scene, s, Transform::identity());
+    add_camera(&mut scene, [0.0, 0.0, 3.5], [0.0, 0.0, 0.0], 0.8);
+    scene
+}
+
+/// Showcase of the four path-tracer-only material extensions in one
+/// frame: a brushed-metal plate (anisotropy 0.9 along `X`) on the
+/// left with a dispersive glass sphere above it, an iridescent sphere
+/// in the middle, a backlit diffuse-transmission leaf on the right
+/// (its own point light behind it), on a grey floor in front of an
+/// unlit checker backdrop; one point light above the front; camera at
+/// `(0, 0.6, 4.5)`.
+pub fn material_extensions() -> Scene3D {
+    use oxideav_mesh3d::material::{
+        Anisotropy, DiffuseTransmission, Iridescence, Transmission, Volume,
+    };
+    let mut scene = Scene3D::new();
+    let floor = scene.add_material(diffuse_material([0.5, 0.5, 0.5], 1.0));
+    let mut p = quad(
+        [
+            [-4.0, -1.0, 4.0],
+            [4.0, -1.0, 4.0],
+            [4.0, -1.0, -4.0],
+            [-4.0, -1.0, -4.0],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(floor);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    let tex = scene.add_texture(raw_texture(
+        64,
+        64,
+        &checker_rgba8(64, 8, [230, 230, 230, 255], [20, 20, 20, 255]),
+        Sampler::default_sampler(),
+    ));
+    let mut bg = Material::new();
+    bg.base_color_texture = Some(TextureRef::new(tex));
+    bg.ext.unlit = true;
+    let bg = scene.add_material(bg);
+    let mut p = quad(
+        [
+            [-4.0, -1.0, -3.0],
+            [4.0, -1.0, -3.0],
+            [4.0, 5.0, -3.0],
+            [-4.0, 5.0, -3.0],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(bg);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    // Brushed plate.
+    let mut m = Material::new();
+    m.base_color = [0.9, 0.9, 0.9, 1.0];
+    m.metallic = 1.0;
+    m.roughness = 0.35;
+    m.ext.anisotropy = Some(Anisotropy {
+        strength: 0.9,
+        rotation: 0.0,
+        texture: None,
+    });
+    let plate = scene.add_material(m);
+    let mut p = quad(
+        [
+            [-2.4, -0.95, 0.9],
+            [-0.8, -0.95, 0.9],
+            [-0.8, -0.95, -0.7],
+            [-2.4, -0.95, -0.7],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(plate);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    // Dispersive glass sphere over the plate.
+    let mut g = Material::new();
+    g.base_color = [1.0, 1.0, 1.0, 1.0];
+    g.metallic = 0.0;
+    g.roughness = 0.0;
+    g.ext.transmission = Some(Transmission {
+        factor: 1.0,
+        factor_texture: None,
+    });
+    g.ext.volume = Some(Volume {
+        thickness: 1.0,
+        thickness_texture: None,
+        attenuation_distance: None,
+        attenuation_color: [1.0; 3],
+    });
+    g.ext.ior = Some(1.5);
+    g.ext.dispersion = Some(1.0);
+    let glass = scene.add_material(g);
+    let mut s = uv_sphere(0.45, 48, 24);
+    s.material = Some(glass);
+    add_mesh_node(&mut scene, s, translate([-1.6, -0.2, 0.6]));
+    // Iridescent sphere.
+    let mut m = Material::new();
+    m.base_color = [0.8, 0.8, 0.8, 1.0];
+    m.metallic = 0.0;
+    m.roughness = 0.15;
+    m.ext.iridescence = Some(Iridescence {
+        factor: 1.0,
+        thickness_min: 550.0,
+        thickness_max: 550.0,
+        ..Iridescence::default()
+    });
+    let irid = scene.add_material(m);
+    let mut s = uv_sphere(0.6, 48, 24);
+    s.material = Some(irid);
+    add_mesh_node(&mut scene, s, translate([0.0, -0.4, 0.0]));
+    // Backlit leaf + its light.
+    let mut m = Material::new();
+    m.base_color = [0.15, 0.5, 0.1, 1.0];
+    m.metallic = 0.0;
+    m.roughness = 1.0;
+    m.double_sided = true;
+    m.ext.diffuse_transmission = Some(DiffuseTransmission {
+        factor: 0.8,
+        color_factor: [0.6, 0.9, 0.4],
+        ..DiffuseTransmission::default()
+    });
+    let leaf = scene.add_material(m);
+    let mut p = quad(
+        [
+            [0.9, -0.9, 0.3],
+            [2.1, -0.9, 0.3],
+            [2.1, 0.5, 0.3],
+            [0.9, 0.5, 0.3],
+        ],
+        [1.0, 1.0],
+    );
+    p.material = Some(leaf);
+    add_mesh_node(&mut scene, p, Transform::identity());
+    add_light(
+        &mut scene,
+        Light::Point {
+            color: [1.0, 0.95, 0.8],
+            intensity: 6.0,
+            range: None,
+        },
+        [1.5, -0.2, -0.8],
+        [0.0, 0.0, 1.0],
+    );
+    add_light(
+        &mut scene,
+        Light::Point {
+            color: [1.0; 3],
+            intensity: 40.0,
+            range: None,
+        },
+        [0.0, 2.5, 2.0],
+        [0.0, -1.0, -0.5],
+    );
+    add_camera(&mut scene, [0.0, 0.6, 4.5], [0.0, -0.3, 0.0], 0.8);
+    scene
+}
+
 /// Mean absolute per-channel difference (RGB only, `0..=255` scale).
 /// Panics if the dimensions differ.
 pub fn mean_abs_error(a: &RgbaImage, b: &RgbaImage) -> f64 {

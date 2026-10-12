@@ -38,6 +38,11 @@ fn main() {
         ("beam_t0", skinned_morph_beam(), Some(0.0)),
         ("beam_t1", skinned_morph_beam(), Some(1.0)),
         ("normal_map", normal_mapped_quad(0.8), None),
+        ("brushed_metal", brushed_metal_plate(0.9, 0.0), None),
+        ("iridescent", iridescent_sphere(1.0, 550.0), None),
+        ("backlit_leaf", backlit_leaf(0.8), None),
+        ("dispersion", dispersive_sphere(1.0), None),
+        ("material_extensions", material_extensions(), None),
     ];
     for (name, scene, time) in scenes {
         let opts = RenderOptions {

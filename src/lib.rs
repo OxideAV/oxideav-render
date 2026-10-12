@@ -1,7 +1,9 @@
 //! # oxideav-render
 //!
-//! **Status:** Phase E — scanline, Whitted raycast and Monte Carlo
-//! path-tracing backends live.
+//! **Status:** Phase F — scanline, Whitted raycast and Monte Carlo
+//! path-tracing backends live; textures resolve through the
+//! `oxideav-image` gateway; the path tracer shades every ratified KHR
+//! material extension mesh3d carries.
 //!
 //! Pure-Rust 3D-scene → raster image/video renderer for the
 //! [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
@@ -38,7 +40,8 @@
 //! | B     | Scanline backend (Gouraud / Phong / Wireframe / Flat / NormalDebug / Depth).  |
 //! | C     | `oxideav-pipeline` `DagNode::Render3D` source — emits `Frame::Video`.         |
 //! | D     | `RenderBackend::Raycast` — Whitted primary + shadow + reflection / refraction.|
-//! | E *(now)* | `RenderBackend::PathTrace` — Kajiya path tracing, NEE + MIS, glTF BSDF.   |
+//! | E     | `RenderBackend::PathTrace` — Kajiya path tracing, NEE + MIS, glTF BSDF.      |
+//! | F *(now)* | Production textures via the `oxideav-image` gateway; the remaining KHR material extensions (anisotropy, iridescence, diffuse transmission, dispersion) in the path tracer. |
 //!
 //! ## Quick start
 //!

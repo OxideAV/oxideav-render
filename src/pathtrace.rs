@@ -156,6 +156,15 @@
 //! 9. Offset the origin with [`crate::trace::offset_ray_origin`] to
 //!    the side of the geometric normal `l` leaves on; continue at 1.
 //!
+//! **Dispersion** (`KHR_materials_dispersion`, step 6 onward at a hit
+//! of a volume with `dispersion > 0`): the path carries one colour
+//! channel from the first such hit on — channel `c = ⌊3·ξ⌋` with the
+//! coin of ray id `(k << 16) | 0x7fff` (§2), `β ← 3·β·e_c` — and every
+//! later BSDF of a dispersive material uses that channel's index
+//! [`dispersion_iors`]`(ior, dispersion)[c]` (`ior ± (ior − 1)·0.025·
+//! dispersion`, red lowest). One-sample estimation over the three
+//! bands: unbiased, no colour bias in the mean.
+//!
 //! Every contribution except camera-visible emission (`k = 0`, step 4)
 //! is clamped so `max(rgb) ≤ clamp` when [`PathTraceOptions::clamp`]
 //! is non-zero (biased).
@@ -200,8 +209,35 @@
 //!   n_c·v)`; `f = (1 − F_c)·f_base + F_c·D_c G₂_c/(4|n_c·v||n_c·l|)`
 //!   with its own normal and roughness.
 //!
+//! * anisotropy (`KHR_materials_anisotropy`): the base specular `D` /
+//!   `G` become the anisotropic GGX in the frame `(t_a, b_a, n)` with
+//!   `α_t = mix(α, 1, strength²)` along `t_a` and `α_b = α` along
+//!   `b_a = n × t_a`, where `t_a` is the material's direction
+//!   ([`MaterialSample::anisotropy_direction`]: the vertex tangent
+//!   frame rotated by `anisotropyRotation` and the texture's RG
+//!   vector) re-orthogonalised against the normal-mapped `n`:
+//!   `D(h) = 1 / (π α_t α_b ((h·t_a/α_t)² + (h·b_a/α_b)² + (h·n)²)²)`,
+//!   `Λ(ω) = (√(1 + (α_t² ω_t² + α_b² ω_b²)/ω_n²) − 1)/2` (Heitz
+//!   2014). Strength 0 is the isotropic model bit for bit;
+//! * iridescence (`KHR_materials_iridescence`): the Fresnel terms of
+//!   the base specular become `F_d' = mix(s·F_d, F_irid(s·F₀ᵈ), i)` and
+//!   `F_m' = mix(F_m, F_irid(baseColor), i)` with the thin-film
+//!   reflectance [`iridescent_fresnel`]`(1, iridescenceIor, F₀,
+//!   thickness, v·h)` (Belcour & Barla 2017 as written in the
+//!   extension: Schlick interfaces, base IOR from `F₀`, two
+//!   interference orders, Fourier-space spectral integration with the
+//!   Gaussian CIE fit, Rec. 709 output); the diffuse weight uses
+//!   `1 − max(F_d')` (`rgb_mix`). Disabled inside a volume like sheen
+//!   and clearcoat;
+//! * diffuse transmission (`KHR_materials_diffuse_transmission`): the
+//!   dielectric base becomes `mix(diffuse(baseColor),
+//!   diffuse_btdf(dtColor), dt)` — the Lambertian lobe above keeps
+//!   `(1 − dt)` of its weight and a Lambertian lobe `(1−m)(1−t)·dt·
+//!   (1 − max(F_d'(n·v)))·dtColor/π` scatters into the lower
+//!   hemisphere (cosine-sampled about `−n`).
+//!
 //! Inside a volume (back face of a material with thickness > 0) the
-//! sheen and clearcoat layers are disabled.
+//! sheen, clearcoat and iridescence layers are disabled.
 //! The occlusion texture is ignored: the path tracer computes
 //! occlusion itself (glTF §3.9.4 defines it as a hint for indirect
 //! lighting approximations).
@@ -209,12 +245,15 @@
 //! **Lobe selection** (from `v` only, `c_v = n·v`):
 //! `F̄_d = s·max(F_d at c_v)`, `F̄_m = mean(Schlick(baseColor, c_v))`,
 //! `w_cc = F_c`, `S = (1 − w_cc)(1 − max(sheenColor)·E(c_v))`,
-//! `p ∝ [diffuse: S(1−m)(1−t)(1−F̄_d)·mean(baseColor),
+//! `p ∝ [diffuse: S(1−m)(1−t)(1−dt)(1−F̄_d)·mean(baseColor),
 //! specular: S((1−m)F̄_d + m F̄_m), transmission: S(1−m)t(1−F̄_d)·mean(baseColor),
-//! clearcoat: w_cc, sheen: (1 − w_cc)·max(sheenColor)·E(c_v)]`,
+//! clearcoat: w_cc, sheen: (1 − w_cc)·max(sheenColor)·E(c_v),
+//! diffuse transmission: S(1−m)(1−t)·dt·(1−F̄_d)·mean(dtColor)]`
+//! (`F̄_d`, `F̄_m` from the iridescence-mixed Fresnel terms),
 //! normalised; the CDF is walked in that order with the lobe-select
 //! dimension. Diffuse and sheen sample the cosine-weighted hemisphere
-//! about `n` (Shirley-Chiu concentric map, then Malley's projection);
+//! about `n` (Shirley-Chiu concentric map, then Malley's projection),
+//! diffuse transmission the one about `−n`;
 //! specular, transmission and clearcoat sample GGX visible normals
 //! (Heitz, "Sampling the GGX Distribution of Visible Normals", JCGT
 //! 7(4), 2018) — reflect for specular / clearcoat, mirror (thin) or
@@ -661,6 +700,115 @@ const LOBE_SPECULAR: usize = 1;
 const LOBE_TRANSMISSION: usize = 2;
 const LOBE_CLEARCOAT: usize = 3;
 const LOBE_SHEEN: usize = 4;
+const LOBE_DIFFUSE_T: usize = 5;
+const LOBES: usize = 6;
+
+/// The base specular microfacet of one shading point: GGX with
+/// `(α_t, α_b)` in the frame `(t, b, n)` (`KHR_materials_anisotropy`;
+/// isotropic when `α_t = α_b`, in which case the historical isotropic
+/// code paths are used verbatim).
+#[derive(Debug, Clone, Copy)]
+struct Microfacet {
+    t: [f32; 3],
+    b: [f32; 3],
+    n: [f32; 3],
+    at: f32,
+    ab: f32,
+    aniso: bool,
+}
+
+impl Microfacet {
+    fn isotropic(n: [f32; 3], a: f32) -> Self {
+        let (t, b) = basis(n);
+        Self {
+            t,
+            b,
+            n,
+            at: a,
+            ab: a,
+            aniso: false,
+        }
+    }
+
+    #[inline]
+    fn local(&self, w: [f32; 3]) -> [f32; 3] {
+        [
+            vec3_dot(w, self.t),
+            vec3_dot(w, self.b),
+            vec3_dot(w, self.n),
+        ]
+    }
+
+    /// `D(h)` (Burley's anisotropic GGX as written in the
+    /// `KHR_materials_anisotropy` text; Walter 2007 when isotropic).
+    #[inline]
+    fn d(&self, h: [f32; 3]) -> f32 {
+        if !self.aniso {
+            return d_ggx(vec3_dot(self.n, h), self.at);
+        }
+        let hl = self.local(h);
+        if hl[2] <= 0.0 {
+            return 0.0;
+        }
+        let x = hl[0] / self.at;
+        let y = hl[1] / self.ab;
+        let e = x * x + y * y + hl[2] * hl[2];
+        1.0 / (PI * self.at * self.ab * e * e)
+    }
+
+    /// Smith `Λ(ω)` for the anisotropic distribution (Heitz 2014,
+    /// JCGT 3(2), eq. 86 form).
+    #[inline]
+    fn lambda(&self, w: [f32; 3]) -> f32 {
+        if !self.aniso {
+            return lambda(vec3_dot(self.n, w), self.at);
+        }
+        let wl = self.local(w);
+        let cz = wl[2].abs().max(1.0e-7);
+        let a2 = (self.at * wl[0]).powi(2) + (self.ab * wl[1]).powi(2);
+        ((1.0 + a2 / (cz * cz)).sqrt() - 1.0) * 0.5
+    }
+
+    #[inline]
+    fn g1(&self, v: [f32; 3]) -> f32 {
+        1.0 / (1.0 + self.lambda(v))
+    }
+
+    #[inline]
+    fn g2(&self, v: [f32; 3], l: [f32; 3]) -> f32 {
+        1.0 / (1.0 + self.lambda(v) + self.lambda(l))
+    }
+
+    /// Reflection pdf (solid angle of `l`) of VNDF sampling.
+    #[inline]
+    fn pdf_reflect(&self, v: [f32; 3], h: [f32; 3]) -> f32 {
+        if !self.aniso {
+            return vndf_reflect_pdf(self.n, v, h, self.at);
+        }
+        let nv = vec3_dot(self.n, v);
+        let nh = vec3_dot(self.n, h);
+        if nv <= 0.0 || nh <= 0.0 || vec3_dot(v, h) <= 0.0 {
+            return 0.0;
+        }
+        self.g1(v) * self.d(h) / (4.0 * nv)
+    }
+
+    /// Sample a visible microfacet normal (world space) for `v`
+    /// (Heitz 2018, anisotropic stretch). `None` when `v` is below the
+    /// surface.
+    fn sample(&self, v: [f32; 3], u0: f32, u1: f32) -> Option<[f32; 3]> {
+        let vl = self.local(v);
+        if vl[2] <= 0.0 {
+            return None;
+        }
+        let h = if self.aniso {
+            sample_vndf_aniso(vl, self.at, self.ab, u0, u1)
+        } else {
+            sample_vndf(vl, self.at, u0, u1)
+        };
+        Some(to_world(self.t, self.b, self.n, h))
+    }
+}
 
 /// The layered glTF BSDF at one shading point (§4 of the module
 /// docs). `v` is fixed at construction.
@@ -672,7 +820,7 @@ pub struct Bsdf {
     ncc: [f32; 3],
     base: [f32; 3],
     metallic: f32,
-    alpha: f32,
+    mf: Microfacet,
     specular: f32,
     f0d: [f32; 3],
     transmission: f32,
@@ -684,11 +832,18 @@ pub struct Bsdf {
     sheen: [f32; 3],
     sheen_rough: f32,
     sheen_alpha: f32,
+    /// `KHR_materials_iridescence` strength, thin-film IOR, thickness.
+    irid: f32,
+    irid_ior: f32,
+    irid_thick: f32,
+    /// `KHR_materials_diffuse_transmission` share and colour.
+    dt: f32,
+    dt_color: [f32; 3],
     /// `F_c` at `v` (clearcoat weight).
     w_cc: f32,
     /// Lobe-selection probabilities (diffuse, specular, transmission,
-    /// clearcoat, sheen).
-    probs: [f32; 5],
+    /// clearcoat, sheen, diffuse transmission).
+    probs: [f32; LOBES],
 }
 
 impl Bsdf {
@@ -720,6 +875,30 @@ impl Bsdf {
         let inside = !thin && !front;
         let r0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
         let base = [m.base_color[0], m.base_color[1], m.base_color[2]];
+        let alpha = (m.roughness * m.roughness).max(MIN_ALPHA);
+        // Anisotropy: the roughness along the material's direction is
+        // raised to `mix(α, 1, strength²)`; the frame is the direction
+        // re-orthogonalised against the (normal-mapped) shading normal.
+        let aniso = m.anisotropy.clamp(0.0, 1.0);
+        let mut mf = Microfacet::isotropic(n, alpha);
+        if aniso > 0.0 {
+            let d0 = m.anisotropy_direction;
+            let dn = vec3_dot(d0, n);
+            let t = vec3_normalise([d0[0] - n[0] * dn, d0[1] - n[1] * dn, d0[2] - n[2] * dn]);
+            if vec3_dot(t, t) > 0.5 {
+                let at = alpha + (1.0 - alpha) * aniso * aniso;
+                if at > alpha {
+                    mf = Microfacet {
+                        t,
+                        b: vec3_cross(n, t),
+                        n,
+                        at,
+                        ab: alpha,
+                        aniso: true,
+                    };
+                }
+            }
+        }
         let mut b = Self {
             v,
             n,
@@ -727,7 +906,7 @@ impl Bsdf {
             ncc,
             base,
             metallic: m.metallic,
-            alpha: (m.roughness * m.roughness).max(MIN_ALPHA),
+            mf,
             specular: m.specular.clamp(0.0, 1.0),
             f0d: [
                 (r0 * m.specular_color[0]).min(1.0),
@@ -743,8 +922,29 @@ impl Bsdf {
             sheen: if inside { [0.0; 3] } else { m.sheen_color },
             sheen_rough: m.sheen_roughness,
             sheen_alpha: (m.sheen_roughness * m.sheen_roughness).max(1.0e-3),
+            irid: if inside {
+                0.0
+            } else {
+                m.iridescence.clamp(0.0, 1.0)
+            },
+            irid_ior: if m.iridescence_ior.is_finite() {
+                m.iridescence_ior.max(1.0)
+            } else {
+                1.3
+            },
+            irid_thick: if m.iridescence_thickness.is_finite() {
+                m.iridescence_thickness.max(0.0)
+            } else {
+                400.0
+            },
+            dt: m.diffuse_transmission.clamp(0.0, 1.0),
+            dt_color: [
+                m.diffuse_transmission_color[0].clamp(0.0, 1.0),
+                m.diffuse_transmission_color[1].clamp(0.0, 1.0),
+                m.diffuse_transmission_color[2].clamp(0.0, 1.0),
+            ],
             w_cc: 0.0,
-            probs: [0.0; 5],
+            probs: [0.0; LOBES],
         };
         let cv = vec3_dot(n, v).max(1.0e-4);
         b.w_cc = if b.clearcoat > 0.0 {
@@ -759,16 +959,19 @@ impl Bsdf {
             0.0
         };
         let s_scale = (1.0 - b.w_cc) * (1.0 - sheen_max * e_v);
-        let fd = b.specular * max3(b.fresnel_d(cv));
-        let fm = mean3(schlick(base, cv));
+        let (fd_v, fm_v) = b.fresnel_pair(cv);
+        let fd = max3(fd_v);
+        let fm = mean3(fm_v);
         let m_ = b.metallic;
         let base_mean = mean3(base).max(0.0);
+        let t = b.transmission;
         let mut p = [
-            s_scale * (1.0 - m_) * (1.0 - b.transmission) * (1.0 - fd) * base_mean,
+            s_scale * (1.0 - m_) * (1.0 - t) * (1.0 - b.dt) * (1.0 - fd) * base_mean,
             s_scale * ((1.0 - m_) * fd + m_ * fm),
-            s_scale * (1.0 - m_) * b.transmission * (1.0 - fd) * base_mean,
+            s_scale * (1.0 - m_) * t * (1.0 - fd) * base_mean,
             b.w_cc,
             (1.0 - b.w_cc) * sheen_max * e_v,
+            s_scale * (1.0 - m_) * (1.0 - t) * b.dt * (1.0 - fd) * mean3(b.dt_color).max(0.0),
         ];
         let sum: f32 = p.iter().sum();
         if sum > 0.0 && sum.is_finite() {
@@ -776,7 +979,7 @@ impl Bsdf {
                 *x /= sum;
             }
         } else {
-            p = [0.0; 5];
+            p = [0.0; LOBES];
         }
         b.probs = p;
         b
@@ -788,9 +991,23 @@ impl Bsdf {
     }
 
     /// Lobe-selection probabilities (diffuse, specular, transmission,
-    /// clearcoat, sheen).
+    /// clearcoat, sheen). With `KHR_materials_diffuse_transmission` the
+    /// sixth lobe's share ([`Self::diffuse_transmission_probability`])
+    /// is missing from this sum.
     pub fn lobe_probabilities(&self) -> [f32; 5] {
-        self.probs
+        [
+            self.probs[0],
+            self.probs[1],
+            self.probs[2],
+            self.probs[3],
+            self.probs[4],
+        ]
+    }
+
+    /// Selection probability of the diffuse-transmission lobe
+    /// (`KHR_materials_diffuse_transmission`), 0 without it.
+    pub fn diffuse_transmission_probability(&self) -> f32 {
+        self.probs[LOBE_DIFFUSE_T]
     }
 
     /// Unit geometric normal on the incoming side.
@@ -813,6 +1030,47 @@ impl Bsdf {
         schlick(self.f0d, c)
     }
 
+    /// The effective dielectric and metal Fresnel terms at cosine `c`:
+    /// `(s·F_d, F_m)` in the core model; with
+    /// `KHR_materials_iridescence` each is mixed toward the thin-film
+    /// Fresnel of its base reflectance by the iridescence strength
+    /// (`iridescent_dielectric_layer` / `iridescent_conductor_layer`).
+    #[inline]
+    fn fresnel_pair(&self, c: f32) -> ([f32; 3], [f32; 3]) {
+        let fd = scale(self.fresnel_d(c), self.specular);
+        let fm = schlick(self.base, c);
+        if self.irid <= 0.0 {
+            return (fd, fm);
+        }
+        let i = self.irid;
+        let mix3 = |a: [f32; 3], b: [f32; 3]| {
+            [
+                a[0] + (b[0] - a[0]) * i,
+                a[1] + (b[1] - a[1]) * i,
+                a[2] + (b[2] - a[2]) * i,
+            ]
+        };
+        // Only the layers with weight are evaluated (a thin-film
+        // Fresnel costs three sensitivity fits per interference order).
+        let fd_i = if self.metallic < 1.0 {
+            iridescent_fresnel(
+                1.0,
+                self.irid_ior,
+                scale(self.f0d, self.specular),
+                self.irid_thick,
+                c,
+            )
+        } else {
+            fd
+        };
+        let fm_i = if self.metallic > 0.0 {
+            iridescent_fresnel(1.0, self.irid_ior, self.base, self.irid_thick, c)
+        } else {
+            fm
+        };
+        (mix3(fd, fd_i), mix3(fm, fm_i))
+    }
+
     /// `f(v, l)·|n·l|` and the mixture sampling pdf of `l`.
     pub fn eval(&self, l: [f32; 3]) -> ([f32; 3], f32) {
         let v = self.v;
@@ -824,25 +1082,23 @@ impl Bsdf {
             let nl = vec3_dot(n, l);
             let h = vec3_normalise(add(v, l));
             let vh = vec3_dot(v, h).max(0.0);
-            let nh = vec3_dot(n, h);
             let mut f = [0.0; 3];
             let mut pdf = 0.0;
             if nl > 0.0 {
-                let fd = self.fresnel_d(vh);
-                let fm = schlick(self.base, vh);
-                let spec_c = d_ggx(nh, self.alpha) * g2(nv, nl, self.alpha) / (4.0 * nv * nl);
+                let (fd, fm) = self.fresnel_pair(vh);
+                let spec_c = self.mf.d(h) * self.mf.g2(v, l) / (4.0 * nv * nl);
                 let m = self.metallic;
                 let diff_k =
-                    (1.0 - m) * (1.0 - self.transmission) * (1.0 - self.specular * max3(fd)) / PI;
+                    (1.0 - m) * (1.0 - self.transmission) * (1.0 - self.dt) * (1.0 - max3(fd)) / PI;
                 let mut layer = [0.0; 3];
                 for k in 0..3 {
-                    layer[k] = spec_c * ((1.0 - m) * self.specular * fd[k] + m * fm[k])
-                        + diff_k * self.base[k];
+                    layer[k] = spec_c * ((1.0 - m) * fd[k] + m * fm[k]) + diff_k * self.base[k];
                 }
                 let smax = max3(self.sheen);
                 if smax > 0.0 {
                     let scale = (1.0 - smax * sheen_albedo(nv, self.sheen_rough))
                         .min(1.0 - smax * sheen_albedo(nl, self.sheen_rough));
+                    let nh = vec3_dot(n, h);
                     let sh = d_charlie(nh, self.sheen_alpha) * v_neubelt(nl, nv);
                     for (lk, sk) in layer.iter_mut().zip(self.sheen) {
                         *lk = *lk * scale + sk * sh;
@@ -852,7 +1108,7 @@ impl Bsdf {
                     f[k] = layer[k] * (1.0 - self.w_cc);
                 }
                 pdf += (p[LOBE_DIFFUSE] + p[LOBE_SHEEN]) * nl / PI;
-                pdf += p[LOBE_SPECULAR] * vndf_reflect_pdf(n, v, h, self.alpha);
+                pdf += p[LOBE_SPECULAR] * self.mf.pdf_reflect(v, h);
             }
             if self.clearcoat > 0.0 {
                 let cnv = vec3_dot(self.ncc, v).max(1.0e-4);
@@ -871,7 +1127,7 @@ impl Bsdf {
             (scale(f, cos), pdf)
         } else {
             // ---- Transmission.
-            if self.transmission <= 0.0 || self.metallic >= 1.0 {
+            if self.metallic >= 1.0 || (self.transmission <= 0.0 && self.dt <= 0.0) {
                 return ([0.0; 3], 0.0);
             }
             let nl = -vec3_dot(n, l);
@@ -885,6 +1141,27 @@ impl Bsdf {
                 } else {
                     1.0
                 };
+            let mut f = [0.0; 3];
+            let mut pdf = 0.0;
+            // Diffuse transmission (KHR_materials_diffuse_transmission):
+            // the Lambertian BTDF taking its share of the non-specular
+            // light; Fresnel weighted at the macro normal.
+            if self.dt > 0.0 && self.transmission < 1.0 {
+                let (fd, _) = self.fresnel_pair(nv);
+                let w = (1.0 - self.metallic)
+                    * (1.0 - self.transmission)
+                    * self.dt
+                    * (1.0 - max3(fd))
+                    * layer_scale
+                    / PI;
+                for (fk, ck) in f.iter_mut().zip(self.dt_color) {
+                    *fk += w * ck * nl;
+                }
+                pdf += p[LOBE_DIFFUSE_T] * nl / PI;
+            }
+            if self.transmission <= 0.0 {
+                return (f, pdf);
+            }
             let w = (1.0 - self.metallic) * self.transmission * layer_scale;
             let (val, pdf_t) = if self.thin {
                 let lm = add(l, scale(n, 2.0 * nl)); // mirrored above
@@ -892,12 +1169,12 @@ impl Bsdf {
                 let vh = vec3_dot(v, h);
                 let nh = vec3_dot(n, h);
                 if vh <= 0.0 || nh <= 0.0 {
-                    return ([0.0; 3], 0.0);
+                    return (f, pdf);
                 }
-                let fd = self.specular * max3(self.fresnel_d(vh));
-                let val =
-                    d_ggx(nh, self.alpha) * g2(nv, nl, self.alpha) / (4.0 * nv * nl) * (1.0 - fd);
-                (val, vndf_reflect_pdf(n, v, h, self.alpha))
+                let (fdv, _) = self.fresnel_pair(vh);
+                let fd = max3(fdv);
+                let val = self.mf.d(h) * self.mf.g2(v, lm) / (4.0 * nv * nl) * (1.0 - fd);
+                (val, self.mf.pdf_reflect(v, h))
             } else {
                 let (ei, et) = (self.eta_i, self.eta_t);
                 let mut h = vec3_normalise([
@@ -912,21 +1189,24 @@ impl Bsdf {
                 let lh = vec3_dot(l, h);
                 let nh = vec3_dot(n, h);
                 if vh <= 0.0 || lh >= 0.0 || nh <= 0.0 {
-                    return ([0.0; 3], 0.0);
+                    return (f, pdf);
                 }
                 let denom = ei * vh + et * lh;
                 if denom.abs() < 1.0e-6 {
-                    return ([0.0; 3], 0.0);
+                    return (f, pdf);
                 }
-                let d = d_ggx(nh, self.alpha);
-                let fd = self.specular * max3(self.fresnel_d(vh));
+                let d = self.mf.d(h);
+                let (fdv, _) = self.fresnel_pair(vh);
+                let fd = max3(fdv);
                 let jac = et * et * lh.abs() / (denom * denom);
-                let val = vh * lh.abs() * d * g2(nv, nl, self.alpha) * et * et * (1.0 - fd)
+                let val = vh * lh.abs() * d * self.mf.g2(v, l) * et * et * (1.0 - fd)
                     / (nv * nl * denom * denom);
-                (val, g1(nv, self.alpha) * vh * d / nv * jac)
+                (val, self.mf.g1(v) * vh * d / nv * jac)
             };
-            let f = scale(self.base, w * val * nl);
-            (f, p[LOBE_TRANSMISSION] * pdf_t)
+            for (fk, bk) in f.iter_mut().zip(self.base) {
+                *fk += bk * w * val * nl;
+            }
+            (f, pdf + p[LOBE_TRANSMISSION] * pdf_t)
         }
     }
 
@@ -952,19 +1232,23 @@ impl Bsdf {
                 let (t, b) = basis(self.n);
                 to_world(t, b, self.n, cosine_hemisphere(u[0], u[1]))
             }
-            LOBE_SPECULAR | LOBE_CLEARCOAT | LOBE_TRANSMISSION => {
-                let (nn, a) = if lobe == LOBE_CLEARCOAT {
-                    (self.ncc, self.cc_alpha)
-                } else {
-                    (self.n, self.alpha)
-                };
-                let (t, b) = basis(nn);
-                let vl = [vec3_dot(v, t), vec3_dot(v, b), vec3_dot(v, nn)];
+            LOBE_DIFFUSE_T => {
+                let (t, b) = basis(self.n);
+                let d = cosine_hemisphere(u[0], u[1]);
+                to_world(t, b, self.n, [d[0], d[1], -d[2]])
+            }
+            LOBE_CLEARCOAT => {
+                let (t, b) = basis(self.ncc);
+                let vl = [vec3_dot(v, t), vec3_dot(v, b), vec3_dot(v, self.ncc)];
                 if vl[2] <= 0.0 {
                     return None;
                 }
-                let h = to_world(t, b, nn, sample_vndf(vl, a, u[0], u[1]));
-                if lobe != LOBE_TRANSMISSION {
+                let h = to_world(t, b, self.ncc, sample_vndf(vl, self.cc_alpha, u[0], u[1]));
+                reflect(v, h)
+            }
+            LOBE_SPECULAR | LOBE_TRANSMISSION => {
+                let h = self.mf.sample(v, u[0], u[1])?;
+                if lobe == LOBE_SPECULAR {
                     reflect(v, h)
                 } else if self.thin {
                     let r = reflect(v, h);
@@ -983,7 +1267,8 @@ impl Bsdf {
         // discarded (zero contribution): the mixture pdf `eval`
         // reports for a side only counts the lobes that live there.
         let reflection = vec3_dot(self.ng, l) > 0.0;
-        if reflection == (lobe == LOBE_TRANSMISSION) {
+        let transmits = lobe == LOBE_TRANSMISSION || lobe == LOBE_DIFFUSE_T;
+        if reflection == transmits {
             return None;
         }
         let (f, pdf) = self.eval(l);
@@ -992,6 +1277,151 @@ impl Bsdf {
         }
         Some((l, f, pdf))
     }
+}
+
+// ---------------------------------------------------------------------
+// Anisotropic VNDF sampling.
+// ---------------------------------------------------------------------
+
+/// GGX visible-normal sample in the local frame (`+Z` = normal, `+X`
+/// = `α_t` direction), Heitz 2018 with the anisotropic stretch.
+fn sample_vndf_aniso(v: [f32; 3], at: f32, ab: f32, u0: f32, u1: f32) -> [f32; 3] {
+    let vh = vec3_normalise([at * v[0], ab * v[1], v[2]]);
+    let lensq = vh[0] * vh[0] + vh[1] * vh[1];
+    let t1 = if lensq > 0.0 {
+        let il = 1.0 / lensq.sqrt();
+        [-vh[1] * il, vh[0] * il, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let t2 = vec3_cross(vh, t1);
+    let r = u0.sqrt();
+    let phi = 2.0 * PI * u1;
+    let p1 = r * phi.cos();
+    let mut p2 = r * phi.sin();
+    let s = 0.5 * (1.0 + vh[2]);
+    p2 = (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt() + s * p2;
+    let pz = (1.0 - p1 * p1 - p2 * p2).max(0.0).sqrt();
+    let nh = [
+        p1 * t1[0] + p2 * t2[0] + pz * vh[0],
+        p1 * t1[1] + p2 * t2[1] + pz * vh[1],
+        p1 * t1[2] + p2 * t2[2] + pz * vh[2],
+    ];
+    vec3_normalise([at * nh[0], ab * nh[1], nh[2].max(1.0e-6)])
+}
+
+// ---------------------------------------------------------------------
+// Thin-film iridescence (KHR_materials_iridescence; Belcour & Barla 2017).
+// ---------------------------------------------------------------------
+
+/// Thin-film Fresnel reflectance of `KHR_materials_iridescence`
+/// (the extension's `iridescent_fresnel`, Belcour & Barla 2017 §4 with
+/// Schlick interfaces, two interference orders and the analytic
+/// spectral integration in Fourier space): a film of index
+/// `film_ior` and `thickness_nm` nanometres between a medium of index
+/// `outside_ior` and a base of normal-incidence reflectance `base_f0`,
+/// seen at cosine `cos1` of the angle to the (micro)normal. Returns
+/// linear Rec. 709 RGB in `[0, 1]`; `1` under total internal
+/// reflection inside the film.
+pub fn iridescent_fresnel(
+    outside_ior: f32,
+    film_ior: f32,
+    base_f0: [f32; 3],
+    thickness_nm: f32,
+    cos1: f32,
+) -> [f32; 3] {
+    let cos1 = cos1.clamp(0.0, 1.0);
+    // First interface (outside → film).
+    let r0 = ((film_ior - outside_ior) / (film_ior + outside_ior)).powi(2);
+    let r12 = r0 + (1.0 - r0) * (1.0 - cos1).powi(5);
+    let t121 = 1.0 - r12;
+    let sin2_2 = (outside_ior / film_ior).powi(2) * (1.0 - cos1 * cos1);
+    let cos2_sq = 1.0 - sin2_2;
+    if cos2_sq < 0.0 {
+        return [1.0; 3];
+    }
+    let cos2 = cos2_sq.sqrt();
+    // Second interface (film → base), base IOR from its F0.
+    let mut r23 = [0.0f32; 3];
+    let mut phi23 = [0.0f32; 3];
+    for k in 0..3 {
+        let f0 = (base_f0[k] + 1.0e-4).clamp(0.0, 0.9999);
+        let sq = f0.sqrt();
+        let base_ior = (1.0 + sq) / (1.0 - sq);
+        let r1 = ((base_ior - film_ior) / (base_ior + film_ior)).powi(2);
+        r23[k] = r1 + (1.0 - r1) * (1.0 - cos2).powi(5);
+        if base_ior < film_ior {
+            phi23[k] = PI;
+        }
+    }
+    let opd = 2.0 * film_ior * thickness_nm * cos2;
+    let phi12 = if film_ior < outside_ior { PI } else { 0.0 };
+    let phi21 = PI - phi12;
+    let phi = [phi21 + phi23[0], phi21 + phi23[1], phi21 + phi23[2]];
+    let mut out = [0.0f32; 3];
+    let mut r123 = [0.0f32; 3];
+    let mut rs = [0.0f32; 3];
+    for k in 0..3 {
+        r123[k] = (r12 * r23[k]).clamp(1.0e-5, 0.9999);
+        rs[k] = t121 * t121 * r23[k] / (1.0 - r123[k]);
+        out[k] = r12 + rs[k];
+    }
+    let mut cm = [rs[0] - t121, rs[1] - t121, rs[2] - t121];
+    for m in 1..=2 {
+        for k in 0..3 {
+            cm[k] *= r123[k].sqrt();
+        }
+        let sm = eval_sensitivity(
+            m as f32 * opd,
+            [m as f32 * phi[0], m as f32 * phi[1], m as f32 * phi[2]],
+        );
+        for k in 0..3 {
+            out[k] += cm[k] * 2.0 * sm[k];
+        }
+    }
+    [
+        out[0].clamp(0.0, 1.0),
+        out[1].clamp(0.0, 1.0),
+        out[2].clamp(0.0, 1.0),
+    ]
+}
+
+/// Belcour & Barla's Gaussian fit of the CIE 1931 colour-matching
+/// functions evaluated at optical path difference `opd` (nm) with
+/// phase `shift`, converted to linear Rec. 709 (the extension's
+/// `evalSensitivity`).
+fn eval_sensitivity(opd: f32, shift: [f32; 3]) -> [f32; 3] {
+    let phase = 2.0 * PI * opd * 1.0e-9;
+    let val = [5.4856e-13f32, 4.4201e-13, 5.2481e-13];
+    let pos = [1.6810e6f32, 1.7953e6, 2.2084e6];
+    let var = [4.3278e9f32, 9.3046e9, 6.6121e9];
+    let mut xyz = [0.0f32; 3];
+    for k in 0..3 {
+        xyz[k] = val[k]
+            * (2.0 * PI * var[k]).sqrt()
+            * (pos[k] * phase + shift[k]).cos()
+            * (-phase * phase * var[k]).exp();
+    }
+    xyz[0] += 9.7470e-14
+        * (2.0 * PI * 4.5282e9).sqrt()
+        * (2.2399e6 * phase + shift[0]).cos()
+        * (-4.5282e9 * phase * phase).exp();
+    for x in &mut xyz {
+        *x /= 1.0685e-7;
+    }
+    [
+        3.2404542 * xyz[0] - 1.5371385 * xyz[1] - 0.4985314 * xyz[2],
+        -0.969_266 * xyz[0] + 1.8760108 * xyz[1] + 0.041_556 * xyz[2],
+        0.0556434 * xyz[0] - 0.2040259 * xyz[1] + 1.0572252 * xyz[2],
+    ]
+}
+
+/// Per-channel indices of refraction of `KHR_materials_dispersion`:
+/// `half_spread = (ior − 1)·0.025·dispersion`, `[ior − hs, ior, ior +
+/// hs]` (red lowest), each clamped to `≥ 1`.
+pub fn dispersion_iors(ior: f32, dispersion: f32) -> [f32; 3] {
+    let hs = (ior - 1.0) * 0.025 * dispersion.max(0.0);
+    [(ior - hs).max(1.0), ior.max(1.0), (ior + hs).max(1.0)]
 }
 
 // =====================================================================
@@ -1555,6 +1985,8 @@ impl Integrator<'_> {
         let mut prev_pdf = 0.0f32;
         let mut prev_pos = [0.0f32; 3];
         let mut medium: Option<[f32; 3]> = None;
+        // Hero colour channel once a dispersive volume was entered.
+        let mut hero: Option<usize> = None;
         let strategy = self.pt.strategy;
         let mut k: u32 = 0;
         loop {
@@ -1646,6 +2078,25 @@ impl Integrator<'_> {
             }
             if k >= self.pt.max_bounces {
                 break;
+            }
+            // Dispersion: a volume with `KHR_materials_dispersion`
+            // refracts one wavelength band per path. The channel is
+            // chosen once (coin on ray id `k << 16 | 0x7fff`), the
+            // throughput collapses onto it (×3), and every later
+            // refraction uses that channel's IOR.
+            if mat.dispersion > 0.0 && mat.thickness > 0.0 && mat.transmission > 0.0 {
+                let c = match hero {
+                    Some(c) => c,
+                    None => {
+                        let c = ((s.coin(ray_id | 0x7fff, u32::MAX) * 3.0) as usize).min(2);
+                        for (i, b) in beta.iter_mut().enumerate() {
+                            *b = if i == c { *b * 3.0 } else { 0.0 };
+                        }
+                        hero = Some(c);
+                        c
+                    }
+                };
+                mat.ior = dispersion_iors(mat.ior, mat.dispersion)[c];
             }
             let v = neg(d);
             let bsdf = Bsdf::new(&mat, v, surf.geometric_normal, hit.front_face);
@@ -2377,24 +2828,7 @@ mod tests {
             base_color: [base[0], base[1], base[2], 1.0],
             metallic,
             roughness,
-            normal: [0.0, 0.0, 1.0],
-            occlusion: 1.0,
-            emissive: [0.0; 3],
-            unlit: false,
-            alpha_mode: AlphaMode::Opaque,
-            double_sided: false,
-            ior: 1.5,
-            specular: 1.0,
-            specular_color: [1.0; 3],
-            transmission: 0.0,
-            thickness: 0.0,
-            attenuation_color: [1.0; 3],
-            attenuation_distance: f32::INFINITY,
-            clearcoat: 0.0,
-            clearcoat_roughness: 0.0,
-            clearcoat_normal: [0.0, 0.0, 1.0],
-            sheen_color: [0.0; 3],
-            sheen_roughness: 0.0,
+            ..MaterialSample::default()
         }
     }
 
@@ -2546,6 +2980,205 @@ mod tests {
             // The mixture pdf is a (sub-)density over the sphere.
             assert!(pdf_int <= 1.01 && pdf_int > 0.5, "{name}: ∫pdf = {pdf_int}");
         }
+    }
+
+    #[test]
+    fn extension_lobes_sample_their_quadrature_and_conserve_energy() {
+        let v = vec3_normalise([0.6, 0.0, 0.8]);
+        let ng = [0.0, 0.0, 1.0];
+        let mut cases: Vec<(&str, MaterialSample)> = Vec::new();
+        let mut brushed = sample_ms([0.95, 0.9, 0.8], 1.0, 0.5);
+        brushed.anisotropy = 0.9;
+        brushed.anisotropy_direction = [1.0, 0.0, 0.0];
+        cases.push(("brushed metal (along v)", brushed));
+        let mut across = brushed;
+        across.anisotropy_direction = [0.0, 1.0, 0.0];
+        cases.push(("brushed metal (across v)", across));
+        let mut adiel = sample_ms([0.7, 0.3, 0.2], 0.0, 0.45);
+        adiel.anisotropy = 0.7;
+        adiel.anisotropy_direction = [1.0, 0.0, 0.0];
+        cases.push(("anisotropic dielectric", adiel));
+        let mut athin = adiel;
+        athin.transmission = 0.8;
+        cases.push(("anisotropic thin transmission", athin));
+        let mut irid = sample_ms([0.8, 0.8, 0.8], 0.0, 0.3);
+        irid.iridescence = 1.0;
+        irid.iridescence_thickness = 550.0;
+        cases.push(("iridescent dielectric", irid));
+        let mut irid_m = sample_ms([0.9, 0.6, 0.3], 1.0, 0.4);
+        irid_m.iridescence = 0.8;
+        irid_m.iridescence_thickness = 300.0;
+        cases.push(("iridescent metal", irid_m));
+        let mut dt = sample_ms([0.3, 0.6, 0.2], 0.0, 1.0);
+        dt.diffuse_transmission = 0.6;
+        dt.diffuse_transmission_color = [0.9, 0.5, 0.3];
+        cases.push(("diffuse transmission", dt));
+        let mut dt_t = dt;
+        dt_t.transmission = 0.3;
+        dt_t.roughness = 0.5;
+        cases.push(("diffuse + specular transmission", dt_t));
+        for (name, m) in cases {
+            let b = Bsdf::new(&m, v, ng, true);
+            let (eq, pdf_int) = quadrature(&b);
+            let em = monte_carlo(&b, 1 << 16);
+            for k in 0..3 {
+                let tol = 0.02 * eq[k].max(0.05);
+                assert!(
+                    (eq[k] - em[k]).abs() < tol,
+                    "{name} ch{k}: quadrature {} vs sampled {}",
+                    eq[k],
+                    em[k]
+                );
+                assert!(eq[k] <= 1.01, "{name} ch{k}: albedo {}", eq[k]);
+            }
+            assert!(pdf_int <= 1.01 && pdf_int > 0.5, "{name}: ∫pdf = {pdf_int}");
+        }
+    }
+
+    #[test]
+    fn anisotropy_zero_is_isotropic_and_strength_stretches_along_the_direction() {
+        let v = vec3_normalise([0.6, 0.0, 0.8]);
+        let ng = [0.0, 0.0, 1.0];
+        let base = sample_ms([0.9; 3], 1.0, 0.4);
+        let iso = Bsdf::new(&base, v, ng, true);
+        let mut zero = base;
+        zero.anisotropy_direction = [1.0, 0.0, 0.0];
+        let z = Bsdf::new(&zero, v, ng, true);
+        let r = [-0.6, 0.0, 0.8]; // mirror direction
+        let dirs = [
+            r,
+            vec3_normalise([-0.3, 0.1, 0.9]),
+            vec3_normalise([0.2, -0.5, 0.8]),
+            vec3_normalise([-0.8, 0.3, 0.5]),
+        ];
+        for l in dirs {
+            assert_eq!(
+                iso.eval(l),
+                z.eval(l),
+                "strength 0 must be the isotropic code path"
+            );
+        }
+        // Tilt the mirror direction by the same angle toward X (the
+        // anisotropy direction) and toward Y.
+        let lx = vec3_normalise(add(r, [0.35, 0.0, 0.0]));
+        let ly = vec3_normalise(add(r, [0.0, 0.35, 0.0]));
+        let ratio = |b: &Bsdf| b.eval(lx).0[0] / b.eval(ly).0[0];
+        let iso_ratio = ratio(&iso);
+        let mut ax = base;
+        ax.anisotropy = 0.8;
+        ax.anisotropy_direction = [1.0, 0.0, 0.0];
+        let along_x = ratio(&Bsdf::new(&ax, v, ng, true));
+        let mut ay = ax;
+        ay.anisotropy_direction = [0.0, 1.0, 0.0];
+        let along_y = ratio(&Bsdf::new(&ay, v, ng, true));
+        assert!(
+            along_x > 2.0 * iso_ratio,
+            "stretch along X: {along_x} vs isotropic {iso_ratio}"
+        );
+        assert!(
+            along_y < 0.5 * iso_ratio,
+            "stretch along Y: {along_y} vs isotropic {iso_ratio}"
+        );
+        // Sampling of the stretched lobe lands where eval says it
+        // does: the sampled pdf equals the evaluated mixture pdf.
+        let b = Bsdf::new(&ax, v, ng, true);
+        for i in 0..64u32 {
+            let u = sobol_owen_4d(i, 7);
+            if let Some((l, f, pdf)) = b.sample([u[0], u[1], u[2]]) {
+                let (f2, pdf2) = b.eval(l);
+                assert!((pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0));
+                assert_eq!(f, f2);
+            }
+        }
+    }
+
+    #[test]
+    fn iridescent_fresnel_is_bounded_coloured_and_fades_for_thick_films() {
+        let f0 = [0.04; 3];
+        let f = iridescent_fresnel(1.0, 1.3, f0, 400.0, 1.0);
+        for c in f {
+            assert!((0.0..=1.0).contains(&c), "{f:?}");
+        }
+        let spread = |f: [f32; 3]| max3(f) - f[0].min(f[1]).min(f[2]);
+        assert!(spread(f) > 0.02, "a 400 nm film is coloured: {f:?}");
+        // Neighbouring thicknesses are continuous.
+        let g = iridescent_fresnel(1.0, 1.3, f0, 401.0, 1.0);
+        for k in 0..3 {
+            assert!((f[k] - g[k]).abs() < 0.02);
+        }
+        // A very thick film averages every wavelength: grey again.
+        let thick = iridescent_fresnel(1.0, 1.3, f0, 20_000.0, 1.0);
+        assert!(spread(thick) < 2e-3, "{thick:?}");
+        // Grazing incidence reflects (almost) everything.
+        let gz = iridescent_fresnel(1.0, 1.3, f0, 400.0, 0.0);
+        assert!(gz.iter().all(|&c| c > 0.95), "{gz:?}");
+        // Film thinner than the outside medium: total internal
+        // reflection beyond the critical angle.
+        assert_eq!(iridescent_fresnel(1.5, 1.0, f0, 400.0, 0.1), [1.0; 3]);
+        // Strength 0 leaves the core model untouched; strength 1 on a
+        // grey dielectric tints its mirror reflection.
+        let v = vec3_normalise([0.3, 0.0, 0.95]);
+        let ng = [0.0, 0.0, 1.0];
+        let plain = sample_ms([0.8; 3], 0.0, 0.2);
+        let mut off = plain;
+        off.iridescence_thickness = 550.0;
+        let r = [-0.3, 0.0, 0.95];
+        assert_eq!(
+            Bsdf::new(&plain, v, ng, true).eval(r),
+            Bsdf::new(&off, v, ng, true).eval(r)
+        );
+        let mut on = off;
+        on.iridescence = 1.0;
+        let (fp, _) = Bsdf::new(&plain, v, ng, true).eval(r);
+        let (fi, _) = Bsdf::new(&on, v, ng, true).eval(r);
+        assert!(spread(fp) / max3(fp) < 1e-3, "grey without: {fp:?}");
+        assert!(spread(fi) / max3(fi) > 0.1, "tinted with: {fi:?}");
+    }
+
+    #[test]
+    fn diffuse_transmission_moves_lambert_energy_below_the_surface() {
+        let n = [0.0, 0.0, 1.0];
+        let mut m = sample_ms([1.0; 3], 0.0, 1.0);
+        m.specular = 0.0;
+        m.diffuse_transmission = 1.0;
+        m.diffuse_transmission_color = [0.5, 1.0, 0.25];
+        let b = Bsdf::new(&m, n, n, true);
+        let (fa, pa) = b.eval(vec3_normalise([0.3, 0.2, 0.9]));
+        assert_eq!(fa, [0.0; 3], "nothing reflects");
+        assert_eq!(pa, 0.0);
+        let l = vec3_normalise([0.3, 0.2, -0.9]);
+        let (fb, pb) = b.eval(l);
+        let nl = -l[2];
+        for k in 0..3 {
+            let want = m.diffuse_transmission_color[k] * nl / PI;
+            assert!((fb[k] - want).abs() < 1e-5, "{fb:?}");
+        }
+        assert!((pb - nl / PI).abs() < 1e-5);
+        assert_eq!(b.diffuse_transmission_probability(), 1.0);
+        let e = monte_carlo(&b, 4096);
+        for k in 0..3 {
+            assert!(
+                (e[k] - m.diffuse_transmission_color[k] as f64).abs() < 2e-3,
+                "{e:?}"
+            );
+        }
+        // Half and half: reflection keeps (1 − dt) of white Lambert.
+        m.diffuse_transmission = 0.5;
+        let b = Bsdf::new(&m, n, n, true);
+        let (fa, _) = b.eval(vec3_normalise([0.0, 0.0, 1.0]));
+        assert!((fa[0] - 0.5 / PI).abs() < 1e-5, "{fa:?}");
+        let e = monte_carlo(&b, 4096);
+        assert!((e[1] - 1.0).abs() < 2e-3, "{e:?}");
+        assert!((e[0] - 0.75).abs() < 2e-3, "{e:?}");
+    }
+
+    #[test]
+    fn dispersion_iors_spread_around_the_centre_index() {
+        assert_eq!(dispersion_iors(1.5, 0.0), [1.5; 3]);
+        let d = dispersion_iors(1.5, 0.36);
+        assert!(d[0] < d[1] && d[1] < d[2]);
+        assert!((d[2] - d[0] - 0.5 * 0.05 * 0.36).abs() < 1e-6);
+        assert!(dispersion_iors(1.01, 100.0).iter().all(|&i| i >= 1.0));
     }
 
     #[test]

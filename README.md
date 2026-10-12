@@ -16,7 +16,7 @@ layer:
 | ----------- | ----------------------------------------------------------- |
 | `Scanline`  | done — clipped, perspective-correct, tile-parallel rasteriser; glTF 2.0 metallic-roughness `Pbr` mode (textures, normal / occlusion / emissive maps, vertex colours, unlit, punctual lights, OPAQUE / MASK / BLEND, back-face culling, shadow maps with PCF) plus the legacy Flat / Gouraud / Phong / Wireframe / NormalDebug / DepthDebug modes |
 | `Raycast`   | done — Whitted recursive ray tracer on the prep + trace layers: the scanline glTF `Pbr` model per hit (pixel-identical to scanline without secondary rays) plus ray-traced hard shadows for every light type, Fresnel-weighted mirror reflection, refraction (`KHR_materials_transmission` / `_volume` / `_ior`), MASK any-hit and BLEND see-through rays; legacy modes unchanged; HDR output; tile-parallel |
-| `PathTrace` | done — unbiased Monte Carlo path tracer: NEE to punctual + emissive-triangle lights (Arvo spherical-triangle sampling) with MIS, glTF metallic-roughness BSDF with GGX VNDF sampling plus transmission / volume / ior / specular / clearcoat / sheen, MASK / stochastic BLEND, uniform sky or HDR environment map, Owen-scrambled Sobol' sampling, progressive `PathTracer` |
+| `PathTrace` | done — unbiased Monte Carlo path tracer: NEE to punctual + emissive-triangle lights (Arvo spherical-triangle sampling) with MIS, glTF metallic-roughness BSDF with GGX VNDF sampling plus every ratified KHR material extension — transmission / volume / ior / specular / clearcoat / sheen / anisotropy / iridescence / diffuse transmission / dispersion — MASK / stochastic BLEND, uniform sky or HDR environment map, Owen-scrambled Sobol' sampling, progressive `PathTracer` |
 
 ### Shared layers (public, backend-agnostic)
 
@@ -108,6 +108,31 @@ background bytes exactly; `aa` and `shading` are ignored.
 The `pathtrace` module docs are the normative estimator specification
 (sequence dimensions, lobe-selection probabilities, light-selection
 pdf, MIS weights, roulette rule) for ports such as the GPU backend.
+
+#### KHR material extensions
+
+The path tracer shades every material extension `oxideav-mesh3d`
+carries. Beyond the ones every backend evaluates (`KHR_materials_ior`
+/ `_specular` / `_emissive_strength` / `_unlit` / `_transmission` /
+`_volume`) and the layers the path tracer added in Phase E
+(`_clearcoat`, `_sheen`), Phase F adds the four that only make sense
+with real light transport:
+
+| Extension | Model |
+| --- | --- |
+| `KHR_materials_anisotropy` | anisotropic GGX (`α_t = mix(α, 1, strength²)` along the material direction, `α_b = α`), anisotropic Smith masking, visible-normal sampling in the direction's frame; direction = vertex tangent frame × `anisotropyRotation` × texture RG, strength × texture B. Strength 0 is the isotropic model bit for bit. |
+| `KHR_materials_iridescence` | thin-film Fresnel (Belcour & Barla 2017, as written in the extension: Schlick interfaces, base IOR from F₀, two interference orders, Fourier-space spectral integration) mixed into the dielectric and metal Fresnel by the strength; `iridescenceIor`, thickness min / max × texture; `rgb_mix` energy rule. `pathtrace::iridescent_fresnel` is public. |
+| `KHR_materials_diffuse_transmission` | Lambertian BTDF taking `dt` of the non-specular share into the lower hemisphere (colour factor × texture), cosine-sampled. |
+| `KHR_materials_dispersion` | one colour channel per path through dispersive volumes (`pathtrace::dispersion_iors`: `ior ± (ior − 1)·0.025·dispersion`), unbiased one-sample channel estimation — fringes with an unchanged mean. |
+
+`testscenes::{brushed_metal_plate, iridescent_sphere, backlit_leaf,
+dispersive_sphere, material_extensions}` are the reference scenes;
+`tests/pathtrace_materials.rs` pins their rendered properties
+(highlight stretch follows the anisotropy rotation, white light is
+tinted by the film, the backlit leaf glows only — and linearly — with
+diffuse transmission, dispersion fringes leave the mean unchanged).
+The scanline and raycast backends keep the core model for these
+materials (the extensions are ignored there).
 
 ## Usage
 

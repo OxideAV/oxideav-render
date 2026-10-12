@@ -331,6 +331,20 @@ fn pathtrace_benches(c: &mut Criterion) {
     g.bench_function("pathtrace_resolve_image_1080p", |b| {
         b.iter(|| black_box(hd_tracer.image()))
     });
+    let showcase = oxideav_render::testscenes::material_extensions();
+    let showcase16 = RenderOptions {
+        scene_camera: Some(0),
+        use_scene_lights: true,
+        path_trace: PathTraceOptions {
+            samples_per_pixel: 16,
+            max_bounces: 6,
+            ..PathTraceOptions::default()
+        },
+        ..opts(256, ShadingMode::Pbr, 1)
+    };
+    g.bench_function("pathtrace_materials_16spp_256", |b| {
+        b.iter(|| black_box(renderer.render(black_box(&showcase), &showcase16).unwrap()))
+    });
     let sphere = sphere_scene(32, 16);
     let sphere16 = RenderOptions {
         path_trace: spp(16),

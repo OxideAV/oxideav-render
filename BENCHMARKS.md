@@ -169,3 +169,28 @@ Same machine as the prep-layer table (AMD Ryzen Threadripper 9970X,
   shorter paths: its 960-triangle BVH is ~20× the Cornell box's
   triangle count, and every bounce off the convex sphere traverses it
   for both the continuation ray and the shadow ray.
+
+## Path tracer: KHR material extensions (2026-10-13)
+
+Apple Silicon (aarch64-apple-darwin, 10 cores), rustc 1.97 release
+profile — a different host from the Linux tables above, so compare
+within this table only. 256² frames, 16 spp, `testscenes` reference
+scenes; each extension toggled off / on in the same scene.
+
+| Scene (256², 16 spp) | off | on | Δ |
+| --- | --- | --- | --- |
+| `brushed_metal_plate` anisotropy 0 → 0.9 (2 bounces) | 70.6 ms | 71.0 ms | +0.6 % |
+| `iridescent_sphere` iridescence 0 → 1 (2 bounces) | 51.5 ms | 56.0 ms | +9 % (one thin-film Fresnel per hit; the metal / dielectric layer without weight is skipped) |
+| `backlit_leaf` diffuse transmission 0 → 0.8 (2 bounces) | 43.2 ms | 43.6 ms | +1 % |
+| `dispersive_sphere` dispersion 0 → 1 (6 bounces) | 67.2 ms | 69.0 ms | +3 % |
+| `material_extensions` showcase (6 bounces) | — | 103 ms | criterion `pathtrace_materials_16spp_256`: 119 ms |
+
+Convergence of the showcase (160×120, 6 bounces) against a 1024-spp
+reference rendered with another seed: 16 spp 28.1 dB (MAE 4.1 / 255,
+37 ms), 64 spp 33.9 dB (2.0, 138 ms), 256 spp 37.3 dB (1.1, 557 ms) —
+≈ +5.8 dB per 4× samples, the unbiased-estimator slope (6 dB).
+
+Criterion `pathtrace` group on this host for reference:
+`pathtrace_cornell_64spp_256` 895 ms, `pathtrace_cornell_refine1_256`
+15.2 ms, `pathtrace_resolve_image_1080p` 3.0 ms,
+`pathtrace_sphere_960tri_16spp_256` 390 ms.
