@@ -707,7 +707,7 @@ fn texture_resolver_reaches_the_raycaster() {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_png::register(&mut ctx);
     let resolver: Arc<dyn oxideav_render::TextureResolver> =
-        Arc::new(oxideav_render::RegistryTextureResolver::new(Arc::new(ctx)));
+        Arc::new(oxideav_render::ImageTextureResolver::new(Arc::new(ctx)));
     let mut r = oxideav_render::RaycastRenderer::with_texture_resolver(resolver.clone());
     let img = r.render(&scene, &o).unwrap();
     let mut dynr = make_renderer(RenderBackend::Raycast).unwrap();

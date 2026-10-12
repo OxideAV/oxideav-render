@@ -45,9 +45,11 @@ identically:
   memoising `TextureCache`, sRGB / linear box-filtered mip chains and
   a glTF-sampler-exact CPU sampler (wrap modes, nearest / bilinear,
   mip nearest / trilinear, LOD from UV derivatives). Under the
-  `registry` feature `RegistryTextureResolver` decodes through an
-  `oxideav_core::RuntimeContext` (whatever image codecs the caller
-  registered) + `oxideav-pixfmt`; the crate itself links no codec.
+  `registry` feature `ImageTextureResolver` decodes through the
+  `oxideav-image` gateway over an `oxideav_core::RuntimeContext` —
+  every image format the caller registered (PNG, JPEG, WebP, HEIF /
+  AVIF, TIFF, OpenEXR / Radiance for HDR, …), float sources staying
+  linear `f32`; the crate itself links no codec.
 * **`brdf`** — glTF Appendix B: GGX, height-correlated Smith,
   Schlick, Lambert.
 * **`hdr`** — `HdrImage` (scene-linear `f32` RGBA, via
@@ -164,11 +166,38 @@ backends agree to rounding on every shared test scene. On top:
 * Texture LOD: ray differentials on camera rays (identical filtering to
   scanline), ray cones after a bounce.
 
-Textures decode through the renderer's `TextureCache`; construct
-`ScanlineRenderer::with_texture_resolver(Arc::new(
-RegistryTextureResolver::new(ctx)))` (or `RaycastRenderer::…`, or
-`Renderer::set_texture_resolver` on any backend) to decode PNG / JPEG
-/ … through the framework registry.
+### Textures through the image gateway
+
+Textures decode through the renderer's `TextureCache`. The default
+resolver only understands the built-in raw RGBA8 container; install
+`ImageTextureResolver` to decode every format registered in a
+`RuntimeContext` through the `oxideav-image` gateway:
+
+```rust,no_run
+use std::sync::Arc;
+use oxideav_render::{make_renderer, EnvironmentMap, ImageTextureResolver, PathTracer, RenderBackend};
+
+let mut ctx = oxideav_core::RuntimeContext::new();
+// oxideav_meta::register_all(&mut ctx);     // or just oxideav_png::register, oxideav_mjpeg::register, …
+let resolver = Arc::new(ImageTextureResolver::new(Arc::new(ctx)).with_base_dir("assets/"));
+
+let mut renderer = make_renderer(RenderBackend::Raycast)?;   // any backend
+renderer.set_texture_resolver(resolver.clone());
+
+// HDR environment map (EXR / Radiance decode to linear f32):
+let sky = resolver.open_image("sky.exr").map_err(|e| oxideav_render::Error::Backend(e.to_string()))?.to_hdr();
+let mut tracer = PathTracer::with_texture_resolver(resolver);
+tracer.set_environment(Some(Arc::new(EnvironmentMap::new(Arc::new(sky), 1.0))));
+# Ok::<(), oxideav_render::Error>(())
+```
+
+Embedded (`bufferView`) and external (`uri`, relative to `with_base_dir`)
+glTF images both resolve; `with_max_pixels` bounds one texture's decoded
+size; `decode_image` keeps the gateway's typed error. `tests/gateway_textures.rs`
+pins PNG, JPEG and EXR textures on all three backends (pixel-identical to
+the raw-texture reference on scanline, within the parity tolerance
+across backends) and an EXR sky lighting the path tracer.
+`RegistryTextureResolver` is the deprecated name of the same thing.
 
 `RenderOptions::validate() -> Result<()>` runs a typed pre-flight
 check of every field and surfaces the first offending one via

@@ -15,9 +15,10 @@
 //!
 //! This crate deliberately does not depend on any image codec. Callers
 //! plug decoding in through the [`TextureResolver`] trait; under the
-//! `registry` feature [`RegistryTextureResolver`] decodes through an
-//! `oxideav_core::RuntimeContext` (whatever image containers/codecs
-//! the caller registered, e.g. via `oxideav-meta`). One format is
+//! `registry` feature [`ImageTextureResolver`] decodes through the
+//! `oxideav-image` gateway over an `oxideav_core::RuntimeContext`
+//! (whatever image containers/codecs the caller registered, e.g. via
+//! `oxideav-meta`; float sources such as EXR stay linear `f32`). One format is
 //! understood natively, with no resolver: [`RAW_RGBA8_MIME`], a
 //! trivial uncompressed container ([`encode_raw_rgba8`]) used by the
 //! procedural [`crate::testscenes`] so textured scenes render in every
@@ -49,7 +50,7 @@ use std::sync::{Arc, OnceLock};
 
 use oxideav_mesh3d::{AssetSource, ImageData, MagFilter, MinFilter, Sampler, Texture, WrapMode};
 
-use crate::hdr::srgb_u8_lut;
+use crate::hdr::{srgb_u8_lut, HdrImage};
 
 /// MIME type of the crate's trivial uncompressed RGBA8 container,
 /// decoded natively without any [`TextureResolver`]. Layout: the 8
@@ -591,41 +592,179 @@ fn embedded_image(_image: &ImageData) -> Option<DecodedImage> {
 }
 
 // ---------------------------------------------------------------------
-// Registry-backed resolver.
+// Gateway-backed resolver (oxideav-image).
 // ---------------------------------------------------------------------
 
-/// [`TextureResolver`] that decodes through an
-/// `oxideav_core::RuntimeContext`: the container registry probes the
-/// bytes (with an extension hint derived from the MIME type), the
-/// first video stream's codec decodes one frame, and `oxideav-pixfmt`
-/// converts it to RGBA8. Supports whatever image formats the caller
-/// registered into the context (e.g. `oxideav_meta::register_all`).
+/// Probe extension hint for a MIME type (`image/png` → `png`).
+///
+/// Known glTF / web image types map explicitly; any other `image/*`
+/// subtype is passed through (`image/avif` → `avif`, `image/heic` →
+/// `heic`, `image/jxl` → `jxl`), with vendor / experimental prefixes
+/// (`x-`, `vnd.`) dropped. `None` for non-image types.
+#[cfg(feature = "registry")]
+pub fn ext_hint_from_mime(mime: &str) -> Option<String> {
+    let m = mime.trim().to_ascii_lowercase();
+    let m = m.split(';').next().unwrap_or("").trim();
+    Some(
+        match m {
+            "image/png" => "png",
+            "image/jpeg" | "image/jpg" | "image/pjpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/bmp" | "image/x-bmp" | "image/x-ms-bmp" => "bmp",
+            "image/gif" => "gif",
+            "image/tiff" | "image/tiff-fx" => "tiff",
+            "image/ktx2" => "ktx2",
+            "image/x-exr" | "image/exr" | "image/aces" => "exr",
+            "image/vnd.radiance" | "image/x-hdr" => "hdr",
+            "image/x-tga" | "image/x-targa" | "image/targa" => "tga",
+            "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence" => "heic",
+            "image/avif" | "image/avif-sequence" => "avif",
+            "image/jxl" => "jxl",
+            "image/jp2" | "image/jpx" | "image/jpm" => "jp2",
+            "image/vnd.ms-photo" | "image/jxr" => "jxr",
+            "image/vnd-ms.dds" | "image/vnd.ms-dds" | "image/x-dds" => "dds",
+            "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+            "image/x-portable-pixmap" | "image/x-portable-anymap" => "ppm",
+            "image/x-pcx" | "image/vnd.zbrush.pcx" => "pcx",
+            "image/qoi" | "image/x-qoi" => "qoi",
+            "image/svg+xml" => "svg",
+            "image/x-pict" | "image/pict" => "pict",
+            "image/vnd.wap.wbmp" => "wbmp",
+            other => {
+                let sub = other.strip_prefix("image/")?;
+                let sub = sub.strip_prefix("x-").unwrap_or(sub);
+                let sub = sub.strip_prefix("vnd.").unwrap_or(sub);
+                let sub: String = sub
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if sub.is_empty() {
+                    return None;
+                }
+                return Some(sub);
+            }
+        }
+        .to_string(),
+    )
+}
+
+/// Turn a decoded gateway picture into renderer texels.
+///
+/// * Float layouts (`is_float()`: EXR, Radiance, float TIFF) become
+///   [`DecodedPixels::RgbaF32`] — scene-linear, never sRGB-decoded;
+///   missing alpha is opaque.
+/// * Everything else becomes [`DecodedPixels::Rgba8`] through the
+///   gateway's `to_rgba8` (YCbCr → RGB with the stream's colour
+///   signal, palettes expanded, alpha opaque when absent). Deeper
+///   integer layouts (`Rgb48Le`, `Rgba64Le`, `Gray16Le`, 10 / 12-bit
+///   YUV) are rounded to 8 bits — the sampler's colour-space rule
+///   (sRGB for colour slots, linear for data slots) needs an encoded
+///   integer source, and 8 bits is what the glTF texture slots are
+///   specified against.
+///
+/// `None` when the gateway cannot reach either layout.
+#[cfg(feature = "registry")]
+pub fn decoded_from_image(img: &oxideav_image::Image) -> Option<DecodedImage> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if img.format().is_float() {
+        let bytes = img.to_packed(oxideav_core::PixelFormat::RgbaF32Le).ok()?;
+        let n = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+        if bytes.len() != n * 4 {
+            return None;
+        }
+        let px: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        return DecodedImage::from_rgba_f32(w, h, px);
+    }
+    DecodedImage::from_rgba8(w, h, img.to_rgba8().ok()?)
+}
+
+impl DecodedImage {
+    /// The texels as a scene-linear [`HdrImage`] — the input of
+    /// [`crate::EnvironmentMap::new`]. `RgbaF32` texels copy straight
+    /// across; `Rgba8` texels are sRGB-decoded (an 8-bit environment
+    /// map is a colour image), alpha linear.
+    pub fn to_hdr(&self) -> HdrImage {
+        let pixels = match &self.pixels {
+            DecodedPixels::RgbaF32(f) => f.clone(),
+            DecodedPixels::Rgba8(b) => {
+                let lut = srgb_u8_lut();
+                let mut out = Vec::with_capacity(b.len());
+                for p in b.chunks_exact(4) {
+                    out.push(lut[p[0] as usize]);
+                    out.push(lut[p[1] as usize]);
+                    out.push(lut[p[2] as usize]);
+                    out.push(p[3] as f32 / 255.0);
+                }
+                out
+            }
+        };
+        HdrImage {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+}
+
+/// [`TextureResolver`] riding the [`oxideav-image`](oxideav_image)
+/// gateway: `oxideav_image::decode_bytes_with` probes the bytes
+/// through the caller's `oxideav_core::RuntimeContext` (extension hint
+/// from the MIME type), decodes the primary picture, and
+/// [`decoded_from_image`] converts it — RGBA8 for integer sources,
+/// linear RGBA `f32` for float sources (EXR / Radiance environment
+/// maps, float TIFF). Every image format registered in the context
+/// (PNG, JPEG, WebP, HEIF / AVIF, TIFF, OpenEXR, … — all of
+/// `oxideav_meta::register_all`) resolves; the crate itself links no
+/// codec.
 ///
 /// `External` URIs are read from the filesystem relative to
-/// [`RegistryTextureResolver::with_base_dir`] (absolute paths as-is);
-/// `data:` / network URIs are refused.
+/// [`ImageTextureResolver::with_base_dir`] (absolute paths as-is);
+/// `data:` / network URIs are refused. [`with_max_pixels`](Self::with_max_pixels)
+/// bounds the decoded size of one texture (the gateway refuses before
+/// decoding).
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use oxideav_render::{make_renderer, ImageTextureResolver, RenderBackend};
+/// let mut ctx = oxideav_core::RuntimeContext::new();
+/// // oxideav_meta::register_all(&mut ctx);  // or the few image crates you need
+/// let resolver = Arc::new(ImageTextureResolver::new(Arc::new(ctx)).with_base_dir("assets/"));
+/// let mut renderer = make_renderer(RenderBackend::PathTrace)?;
+/// renderer.set_texture_resolver(resolver);
+/// # Ok::<(), oxideav_render::Error>(())
+/// ```
 #[cfg(feature = "registry")]
-pub struct RegistryTextureResolver {
+#[derive(Clone)]
+pub struct ImageTextureResolver {
     ctx: Arc<oxideav_core::RuntimeContext>,
     base_dir: Option<std::path::PathBuf>,
+    max_pixels: Option<u64>,
 }
 
 #[cfg(feature = "registry")]
-impl std::fmt::Debug for RegistryTextureResolver {
+impl std::fmt::Debug for ImageTextureResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegistryTextureResolver")
+        f.debug_struct("ImageTextureResolver")
             .field("base_dir", &self.base_dir)
+            .field("max_pixels", &self.max_pixels)
             .finish()
     }
 }
 
 #[cfg(feature = "registry")]
-impl RegistryTextureResolver {
-    /// Decode through `ctx`.
+impl ImageTextureResolver {
+    /// Decode through the formats registered in `ctx`.
     pub fn new(ctx: Arc<oxideav_core::RuntimeContext>) -> Self {
         Self {
             ctx,
             base_dir: None,
+            max_pixels: None,
         }
     }
 
@@ -635,115 +774,159 @@ impl RegistryTextureResolver {
         self
     }
 
-    fn decode_inner(&self, bytes: &[u8], mime: Option<&str>) -> oxideav_core::Result<DecodedImage> {
-        use oxideav_core::{Error as CoreError, Frame};
-        let ext_hint = mime.and_then(|m| {
-            Some(match m {
-                "image/png" => "png",
-                "image/jpeg" => "jpg",
-                "image/webp" => "webp",
-                "image/bmp" => "bmp",
-                "image/gif" => "gif",
-                "image/tiff" => "tiff",
-                "image/ktx2" => "ktx2",
-                "image/x-exr" => "exr",
-                "image/vnd.radiance" => "hdr",
-                "image/x-tga" => "tga",
-                _ => return None,
-            })
-        });
-        let mut probe_input = std::io::Cursor::new(bytes.to_vec());
-        let name = self
-            .ctx
-            .containers
-            .probe_input(&mut probe_input, ext_hint)?;
-        let input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::io::Cursor::new(bytes.to_vec()));
-        let mut demux = self
-            .ctx
-            .containers
-            .open_demuxer(&name, input, &self.ctx.codecs)?;
-        let (stream_index, params) = demux
-            .streams()
-            .iter()
-            .find(|s| s.params.width.is_some())
-            .map(|s| (s.index, s.params.clone()))
-            .ok_or_else(|| CoreError::invalid("no video stream in image container"))?;
-        let mut dec = self.ctx.codecs.first_decoder(&params)?;
-        let frame = loop {
-            match dec.receive_frame() {
-                Ok(Frame::Video(f)) => break f,
-                Ok(_) => continue,
-                Err(_) => {}
-            }
-            let pkt = match demux.next_packet() {
-                Ok(p) => p,
-                Err(CoreError::Eof) => {
-                    dec.flush()?;
-                    match dec.receive_frame()? {
-                        Frame::Video(f) => break f,
-                        _ => return Err(CoreError::invalid("image decoder produced no picture")),
-                    }
-                }
-                Err(e) => return Err(e),
-            };
-            if pkt.stream_index != stream_index {
-                continue;
-            }
-            dec.send_packet(&pkt)?;
-        };
-        let out_params = params;
-        let width = out_params
-            .width
-            .ok_or_else(|| CoreError::invalid("decoder reported no width"))?;
-        let height = out_params
-            .height
-            .ok_or_else(|| CoreError::invalid("decoder reported no height"))?;
-        let fmt = out_params
-            .pixel_format
-            .ok_or_else(|| CoreError::invalid("decoder reported no pixel format"))?;
-        let info = oxideav_pixfmt::FrameInfo::new(fmt, width, height);
-        let rgba = oxideav_pixfmt::convert(
-            &frame,
-            info,
-            oxideav_core::PixelFormat::Rgba,
-            &oxideav_pixfmt::ConvertOptions::default(),
-        )?;
-        let plane = rgba
-            .planes
-            .first()
-            .ok_or_else(|| CoreError::invalid("converted frame has no plane"))?;
-        let row = width as usize * 4;
-        let mut px = Vec::with_capacity(row * height as usize);
-        for y in 0..height as usize {
-            let start = y * plane.stride;
-            px.extend_from_slice(
-                plane
-                    .data
-                    .get(start..start + row)
-                    .ok_or_else(|| CoreError::invalid("short RGBA plane"))?,
-            );
-        }
-        DecodedImage::from_rgba8(width, height, px)
-            .ok_or_else(|| CoreError::invalid("bad decoded image dimensions"))
-    }
-}
-
-#[cfg(feature = "registry")]
-impl TextureResolver for RegistryTextureResolver {
-    fn decode(&self, bytes: &[u8], mime: Option<&str>) -> Option<DecodedImage> {
-        self.decode_inner(bytes, mime).ok()
+    /// Refuse textures whose decoded pixel count exceeds `n`
+    /// (`oxideav_image::OpenOptions::max_pixels`; checked from the
+    /// stream geometry before any pixel is decoded).
+    pub fn with_max_pixels(mut self, n: u64) -> Self {
+        self.max_pixels = Some(n);
+        self
     }
 
-    fn fetch_external(&self, uri: &str) -> Option<Vec<u8>> {
-        if uri.contains("://") || uri.starts_with("data:") {
-            return None;
+    /// The runtime context textures decode through.
+    pub fn context(&self) -> &Arc<oxideav_core::RuntimeContext> {
+        &self.ctx
+    }
+
+    /// The directory relative `External` URIs resolve against.
+    pub fn base_dir(&self) -> Option<&std::path::Path> {
+        self.base_dir.as_deref()
+    }
+
+    /// Decode `bytes` and keep the gateway's error (the
+    /// [`TextureResolver::decode`] impl discards it): `UnknownFormat`
+    /// when no registered container probes the bytes, `NoImage` when
+    /// the container holds no decodable picture, `LimitExceeded` over
+    /// the pixel budget, `Unsupported` when no RGBA layout is
+    /// reachable, `Core` for codec failures.
+    pub fn decode_image(
+        &self,
+        bytes: &[u8],
+        mime: Option<&str>,
+    ) -> Result<DecodedImage, oxideav_image::ImageError> {
+        let mut opts = oxideav_image::OpenOptions::new().with_max_frames(1);
+        if let Some(ext) = mime.and_then(ext_hint_from_mime) {
+            opts = opts.with_ext_hint(ext);
         }
-        let path = std::path::Path::new(uri);
+        if let Some(n) = self.max_pixels {
+            opts = opts.with_max_pixels(n);
+        }
+        let file = oxideav_image::decode_bytes_with(&self.ctx, bytes, &opts)?;
+        decoded_from_image(file.primary()).ok_or_else(|| {
+            oxideav_image::ImageError::Unsupported(format!(
+                "{}x{} {:?} picture reaches neither RGBA8 nor RGBA f32",
+                file.primary().width(),
+                file.primary().height(),
+                file.primary().format()
+            ))
+        })
+    }
+
+    /// Open an image file from disk and decode it like a texture (the
+    /// extension is the probe hint). For environment maps:
+    /// `resolver.open_image("sky.exr")?.to_hdr()`.
+    pub fn open_image(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<DecodedImage, oxideav_image::ImageError> {
+        let path = path.as_ref();
         let full = match (&self.base_dir, path.is_absolute()) {
             (Some(base), false) => base.join(path),
             _ => path.to_path_buf(),
         };
-        std::fs::read(full).ok()
+        let mut opts = oxideav_image::OpenOptions::new().with_max_frames(1);
+        if let Some(n) = self.max_pixels {
+            opts = opts.with_max_pixels(n);
+        }
+        let file = oxideav_image::open_with(&self.ctx, &full, &opts)?;
+        decoded_from_image(file.primary()).ok_or_else(|| {
+            oxideav_image::ImageError::Unsupported(format!(
+                "{}: {:?} picture reaches neither RGBA8 nor RGBA f32",
+                full.display(),
+                file.primary().format()
+            ))
+        })
+    }
+
+    fn resolve_uri(&self, uri: &str) -> Option<std::path::PathBuf> {
+        if uri.contains("://") || uri.starts_with("data:") {
+            return None;
+        }
+        let path = std::path::Path::new(uri);
+        Some(match (&self.base_dir, path.is_absolute()) {
+            (Some(base), false) => base.join(path),
+            _ => path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(feature = "registry")]
+impl TextureResolver for ImageTextureResolver {
+    fn decode(&self, bytes: &[u8], mime: Option<&str>) -> Option<DecodedImage> {
+        self.decode_image(bytes, mime).ok()
+    }
+
+    fn fetch_external(&self, uri: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.resolve_uri(uri)?).ok()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Registry-backed resolver (deprecated thin wrapper).
+// ---------------------------------------------------------------------
+
+/// Previous name of [`ImageTextureResolver`]; decodes through the same
+/// gateway path. Kept for one release as a thin wrapper.
+#[cfg(feature = "registry")]
+#[deprecated(
+    since = "0.0.6",
+    note = "renamed to ImageTextureResolver (decodes through the oxideav-image gateway)"
+)]
+#[derive(Clone)]
+pub struct RegistryTextureResolver {
+    inner: ImageTextureResolver,
+}
+
+#[cfg(feature = "registry")]
+#[allow(deprecated)]
+impl std::fmt::Debug for RegistryTextureResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryTextureResolver")
+            .field("base_dir", &self.inner.base_dir)
+            .finish()
+    }
+}
+
+#[cfg(feature = "registry")]
+#[allow(deprecated)]
+impl RegistryTextureResolver {
+    /// Decode through `ctx`.
+    pub fn new(ctx: Arc<oxideav_core::RuntimeContext>) -> Self {
+        Self {
+            inner: ImageTextureResolver::new(ctx),
+        }
+    }
+
+    /// Resolve relative `External` URIs against `dir`.
+    pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.inner = self.inner.with_base_dir(dir);
+        self
+    }
+
+    /// The gateway resolver this wraps.
+    pub fn into_inner(self) -> ImageTextureResolver {
+        self.inner
+    }
+}
+
+#[cfg(feature = "registry")]
+#[allow(deprecated)]
+impl TextureResolver for RegistryTextureResolver {
+    fn decode(&self, bytes: &[u8], mime: Option<&str>) -> Option<DecodedImage> {
+        self.inner.decode(bytes, mime)
+    }
+
+    fn fetch_external(&self, uri: &str) -> Option<Vec<u8>> {
+        self.inner.fetch_external(uri)
     }
 }
 
@@ -885,5 +1068,36 @@ mod tests {
         assert_eq!(mime_from_uri("a/b/c.PNG"), Some("image/png"));
         assert_eq!(mime_from_uri("tex.jpeg"), Some("image/jpeg"));
         assert_eq!(mime_from_uri("noext"), None);
+    }
+
+    #[cfg(feature = "registry")]
+    #[test]
+    fn ext_hint_covers_known_and_generic_image_types() {
+        let h = |m: &str| ext_hint_from_mime(m);
+        assert_eq!(h("image/png").as_deref(), Some("png"));
+        assert_eq!(h("IMAGE/JPEG; charset=binary").as_deref(), Some("jpg"));
+        assert_eq!(h("image/x-exr").as_deref(), Some("exr"));
+        assert_eq!(h("image/vnd.radiance").as_deref(), Some("hdr"));
+        assert_eq!(h("image/heic").as_deref(), Some("heic"));
+        assert_eq!(h("image/avif").as_deref(), Some("avif"));
+        assert_eq!(h("image/jxl").as_deref(), Some("jxl"));
+        // Unknown subtypes pass through with vendor prefixes dropped.
+        assert_eq!(h("image/x-foo").as_deref(), Some("foo"));
+        assert_eq!(h("image/vnd.bar+xml").as_deref(), Some("bar"));
+        assert_eq!(h("application/octet-stream"), None);
+        assert_eq!(h("image/"), None);
+    }
+
+    #[test]
+    fn decoded_to_hdr_decodes_srgb_bytes_and_copies_floats() {
+        let b = DecodedImage::from_rgba8(1, 1, vec![255, 0, 128, 51]).unwrap();
+        let h = b.to_hdr();
+        let p = h.pixel(0, 0).unwrap();
+        assert_eq!(p[0], 1.0);
+        assert_eq!(p[1], 0.0);
+        assert!((p[2] - 0.2158).abs() < 1e-3);
+        assert!((p[3] - 0.2).abs() < 1e-6);
+        let f = DecodedImage::from_rgba_f32(1, 1, vec![9.0, 0.5, -1.0, 1.0]).unwrap();
+        assert_eq!(f.to_hdr().pixel(0, 0), Some([9.0, 0.5, -1.0, 1.0]));
     }
 }

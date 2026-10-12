@@ -108,6 +108,9 @@ pub use prepare::{
 };
 pub use registry::{register_into, RenderRegistry, RendererFactory};
 #[cfg(feature = "registry")]
+pub use texture::ImageTextureResolver;
+#[cfg(feature = "registry")]
+#[allow(deprecated)]
 pub use texture::RegistryTextureResolver;
 pub use texture::{NoTextureResolver, TextureCache, TextureResolver};
 

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ImageTextureResolver`** (`registry` feature): textures and
+  environment maps decode through the `oxideav-image` gateway
+  (`decode_bytes_with` → `Image`), so every image format registered in
+  the caller's `RuntimeContext` resolves — PNG, JPEG, WebP, HEIF /
+  AVIF, TIFF, OpenEXR, Radiance, … (all of `oxideav_meta::register_all`).
+  Float sources (`PixelFormat::is_float()`: EXR, Radiance, float TIFF)
+  arrive as linear `DecodedPixels::RgbaF32` and are never sRGB-decoded;
+  integer sources arrive as RGBA8 through the gateway's colour-signal
+  aware `to_rgba8` (16-bit sources rounded). `with_base_dir`,
+  `with_max_pixels` (gateway pixel budget, refused before decoding),
+  `decode_image` / `open_image` keep the typed `ImageError`;
+  `ext_hint_from_mime` and `decoded_from_image` are public building
+  blocks; `DecodedImage::to_hdr` feeds `EnvironmentMap::new`.
+- `tests/gateway_textures.rs`: PNG, JPEG and EXR textures on scanline /
+  raycast / pathtrace, parity with the raw-texture reference, float
+  linearity, typed errors + cache memoisation, external URIs, an EXR
+  environment map lighting the path tracer, the deprecated wrapper.
+
+### Changed
+
+- The `registry` feature now pulls `oxideav-image` (which brings
+  `oxideav-pixfmt`) instead of `oxideav-pixfmt` directly.
+- Dev-dependencies `oxideav-mjpeg` and `oxideav-openexr` (JPEG / EXR
+  fixtures for the gateway tests); `oxideav-png` stays for the goldens.
+
+### Deprecated
+
+- `RegistryTextureResolver` — now a thin wrapper over
+  `ImageTextureResolver` (`into_inner`); removed after one release.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-render/compare/v0.0.4...v0.0.5) - 2026-10-04
 
 ### Added

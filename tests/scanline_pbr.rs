@@ -471,7 +471,7 @@ fn registry_resolver_decodes_png_textures() {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_png::register(&mut ctx);
     let resolver: Arc<dyn oxideav_render::TextureResolver> =
-        Arc::new(oxideav_render::RegistryTextureResolver::new(Arc::new(ctx)));
+        Arc::new(oxideav_render::ImageTextureResolver::new(Arc::new(ctx)));
     let mut r = oxideav_render::ScanlineRenderer::with_texture_resolver(resolver.clone());
     use oxideav_render::Renderer;
     let img = r.render(&scene, &o).unwrap();
