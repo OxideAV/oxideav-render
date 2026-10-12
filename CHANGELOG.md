@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-render/compare/v0.0.5...v0.0.6) - 2026-10-12
+
+### Added
+
+- *(pathtrace)* KHR_materials_anisotropy, _iridescence, _diffuse_transmission and _dispersion
+- *(texture)* ImageTextureResolver — textures and HDR environment maps through the oxideav-image gateway
+
+### Other
+
+- README examples use the current registry API
+
 ### Added
 
 - **Path tracer: the remaining KHR material extensions** — every
