@@ -4,14 +4,14 @@
 //! BLEND through rays).
 
 use oxideav_mesh3d::{
-    material::{Transmission, Volume},
     AlphaMode, Light, Material, Mesh, MinFilter, Node, Primitive, Sampler, Scene3D, TextureRef,
     Transform,
+    material::{Transmission, Volume},
 };
 use oxideav_render::testscenes::*;
 use oxideav_render::{
-    make_renderer, BackgroundColor, Camera, DepthRange, PreparedScene, RenderBackend,
-    RenderOptions, RgbaImage, ShadingMode,
+    BackgroundColor, Camera, DepthRange, PreparedScene, RenderBackend, RenderOptions, RgbaImage,
+    ShadingMode, make_renderer,
 };
 
 const BG: [u8; 4] = [0, 0, 0, 255];

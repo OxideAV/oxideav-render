@@ -21,13 +21,13 @@
 //! - **raycast_bake_only_3968tri_1** — 1×1 output isolates scene
 //!   bake + BVH build from per-pixel tracing.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_mesh3d::{
     Indices, Material, MaterialId, Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology,
 };
 use oxideav_render::{
-    make_renderer, BackgroundColor, PathTraceOptions, PathTracer, RenderBackend, RenderOptions,
-    ShadingMode,
+    BackgroundColor, PathTraceOptions, PathTracer, RenderBackend, RenderOptions, ShadingMode,
+    make_renderer,
 };
 
 /// UV sphere: `segments × rings` quads, two triangles each, indexed,

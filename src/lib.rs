@@ -109,7 +109,7 @@ pub use prepare::{
     DrawItem, DrawTopology, LightKind, PrepareOptions, PreparedLight, PreparedMaterial,
     PreparedScene, TextureBinding,
 };
-pub use registry::{register_into, RenderRegistry, RendererFactory};
+pub use registry::{RenderRegistry, RendererFactory, register_into};
 #[cfg(feature = "registry")]
 pub use texture::ImageTextureResolver;
 #[cfg(feature = "registry")]
@@ -374,8 +374,10 @@ mod tests {
         assert_eq!(img.height, 32);
         let any_drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(any_drawn, "scanline backend must paint at least one pixel");
     }
 }
@@ -545,7 +547,12 @@ mod robustness_tests {
         for backend in both_backends() {
             let mut renderer = make_renderer(backend).expect("construct");
             let img = renderer.render(&scene, &tiny_opts()).expect("render");
-            let painted = img.pixels.chunks_exact(4).any(|p| p != [9, 9, 9, 255]);
+            let painted = img
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| *p != [9, 9, 9, 255]);
             assert!(
                 painted,
                 "{backend:?}: the healthy triangle must survive NaN siblings"
@@ -612,7 +619,7 @@ mod robustness_tests {
         for backend in both_backends() {
             let mut renderer = make_renderer(backend).expect("construct");
             let img = renderer.render(&scene, &tiny_opts()).expect("render");
-            for px in img.pixels.chunks_exact(4) {
+            for px in img.pixels.as_chunks::<4>().0 {
                 assert_eq!(px, &[9, 9, 9, 255], "{backend:?}");
             }
         }

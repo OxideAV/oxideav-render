@@ -390,11 +390,7 @@ impl TraceScene {
         };
         let shading_normal = if item.has_vertex_normals && item.normals.len() == p.len() {
             let n = vec3_normalise(interp3(&item.normals, base, b));
-            if vec3_dot(n, n) > 0.5 {
-                n
-            } else {
-                ng
-            }
+            if vec3_dot(n, n) > 0.5 { n } else { ng }
         } else {
             ng
         };
@@ -414,10 +410,10 @@ impl TraceScene {
         let base = 3 * hit.tri as usize;
         let b = hit.barycentric;
         let mut a = mat.base_color[3];
-        if let Some(bind) = &mat.base_color_texture {
-            if let Some(t) = self.sample(item, bind, base, b, None, ColorSpace::Srgb) {
-                a *= t[3];
-            }
+        if let Some(bind) = &mat.base_color_texture
+            && let Some(t) = self.sample(item, bind, base, b, None, ColorSpace::Srgb)
+        {
+            a *= t[3];
         }
         if item.colors.len() == item.positions.len() {
             a *= interp4(&item.colors, base, b)[3];
@@ -603,11 +599,7 @@ impl TraceScene {
             tt[1] * ts[0] + bt[1] * ts[1] + n[1] * ts[2],
             tt[2] * ts[0] + bt[2] * ts[1] + n[2] * ts[2],
         ]);
-        if vec3_dot(nn, nn) > 0.5 {
-            nn
-        } else {
-            n
-        }
+        if vec3_dot(nn, nn) > 0.5 { nn } else { n }
     }
 
     /// Evaluate every material input at `hit` (`surf` from
@@ -918,11 +910,7 @@ impl TraceScene {
             }
             tr.iter().all(|&v| v <= 1.0e-4)
         });
-        if blocked {
-            [0.0; 3]
-        } else {
-            tr
-        }
+        if blocked { [0.0; 3] } else { tr }
     }
 
     /// Direct radiance reflected toward `v` at `p` (shading normal
@@ -1162,9 +1150,10 @@ mod tests {
         assert!(ts.occluded([0.0, 0.5, 0.9], [0.0, 0.0, -1.0], 0.0, 2.0));
         assert!(!ts.occluded([0.0, 0.5, 0.9], [0.0, 0.0, -1.0], 0.0, 1.5));
         // Filter rejecting everything sees nothing.
-        assert!(ts
-            .closest_hit_filtered([0.0, 0.5, 0.9], [0.0, 0.0, -1.0], 0.0, 9.0, |_| false)
-            .is_none());
+        assert!(
+            ts.closest_hit_filtered([0.0, 0.5, 0.9], [0.0, 0.0, -1.0], 0.0, 9.0, |_| false)
+                .is_none()
+        );
     }
 
     #[test]

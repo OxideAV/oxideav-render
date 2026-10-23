@@ -282,13 +282,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use oxideav_mesh3d::{AlphaMode, Scene3D};
 
 use crate::camera::Camera;
-use crate::hdr::{linear_to_srgb_byte, srgb_u8_lut, HdrImage};
+use crate::hdr::{HdrImage, linear_to_srgb_byte, srgb_u8_lut};
 use crate::image::RgbaImage;
 use crate::math::{vec3_cross, vec3_dot, vec3_normalise};
 use crate::options::{LightStrategy, PathTraceOptions, RenderOptions};
 use crate::prepare::{PrepareOptions, PreparedLight, PreparedScene};
 use crate::texture::{ColorSpace, TextureCache, TextureResolver};
-use crate::trace::{interp2, offset_ray_origin, MaterialSample, TexLod, TraceHit, TraceScene};
+use crate::trace::{MaterialSample, TexLod, TraceHit, TraceScene, interp2, offset_ray_origin};
 
 // =====================================================================
 // Sampling primitives.
@@ -1459,11 +1459,11 @@ impl EmissiveLights {
                     return [0.0; 3];
                 }
                 let mut e = m.emissive;
-                if let Some(t) = m.emissive_texture.as_ref().and_then(|b| p.texture(b)) {
-                    if let Some(top) = t.data.mips(ColorSpace::Srgb).last() {
-                        let c = top.texels[0];
-                        e = mul(e, [c[0], c[1], c[2]]);
-                    }
+                if let Some(t) = m.emissive_texture.as_ref().and_then(|b| p.texture(b))
+                    && let Some(top) = t.data.mips(ColorSpace::Srgb).last()
+                {
+                    let c = top.texels[0];
+                    e = mul(e, [c[0], c[1], c[2]]);
                 }
                 e
             })
@@ -1923,14 +1923,13 @@ impl Integrator<'_> {
             return [0.0; 3];
         }
         let mut e = mat.emissive;
-        if let Some(b) = &mat.emissive_texture {
-            if let (Some(tex), Some(uvs)) = (self.ts.prepared.texture(b), item.uv_set(b.uv_set)) {
-                if uvs.len() == item.positions.len() {
-                    let uv = b.transform_uv(interp2(uvs, 3 * hit.tri as usize, hit.barycentric));
-                    let t = tex.sample_lod(uv, 0.0, ColorSpace::Srgb);
-                    e = mul(e, [t[0], t[1], t[2]]);
-                }
-            }
+        if let Some(b) = &mat.emissive_texture
+            && let (Some(tex), Some(uvs)) = (self.ts.prepared.texture(b), item.uv_set(b.uv_set))
+            && uvs.len() == item.positions.len()
+        {
+            let uv = b.transform_uv(interp2(uvs, 3 * hit.tri as usize, hit.barycentric));
+            let t = tex.sample_lod(uv, 0.0, ColorSpace::Srgb);
+            e = mul(e, [t[0], t[1], t[2]]);
         }
         e
     }
@@ -2148,21 +2147,20 @@ impl Integrator<'_> {
                 let pe = self.p_env();
                 let shadow_id = ray_id | 0xffff;
                 if pl_u[2] < pe {
-                    if let Some(env) = self.env {
-                        if let Some((l, le, pdf)) = env.sample(pl_u[0], pl_u[1]) {
-                            let pl = pe * pdf;
-                            let (f, pb) = bsdf.eval(l);
-                            if !is_black(f) && !is_black(le) && pl > 0.0 {
-                                let w = if strategy == LightStrategy::Mis {
-                                    power_heuristic(pl, pb)
-                                } else {
-                                    1.0
-                                };
-                                if self.visible(spawn(l), l, f32::INFINITY, &s, shadow_id, u32::MAX)
-                                {
-                                    let c = scale(mul(mul(beta, f), le), w / pl);
-                                    radiance = add(radiance, self.clamp(c));
-                                }
+                    if let Some(env) = self.env
+                        && let Some((l, le, pdf)) = env.sample(pl_u[0], pl_u[1])
+                    {
+                        let pl = pe * pdf;
+                        let (f, pb) = bsdf.eval(l);
+                        if !is_black(f) && !is_black(le) && pl > 0.0 {
+                            let w = if strategy == LightStrategy::Mis {
+                                power_heuristic(pl, pb)
+                            } else {
+                                1.0
+                            };
+                            if self.visible(spawn(l), l, f32::INFINITY, &s, shadow_id, u32::MAX) {
+                                let c = scale(mul(mul(beta, f), le), w / pl);
+                                radiance = add(radiance, self.clamp(c));
                             }
                         }
                     }
@@ -2759,9 +2757,9 @@ impl crate::Renderer for PathTraceRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Renderer;
     use crate::options::{BackgroundColor, Projection, ShadingMode};
     use crate::testscenes::{add_camera, cuboid, diffuse_material, quad};
-    use crate::Renderer;
     use oxideav_mesh3d::{
         Light, Material, Mesh, Node, Primitive, Specular, Transform, Transmission, Volume,
     };
@@ -2815,7 +2813,7 @@ mod tests {
     fn mean_rgb(img: &HdrImage) -> [f64; 3] {
         let mut s = [0.0f64; 3];
         let n = (img.width * img.height) as f64;
-        for p in img.pixels.chunks_exact(4) {
+        for p in img.pixels.as_chunks::<4>().0 {
             for k in 0..3 {
                 s[k] += p[k] as f64 / n;
             }

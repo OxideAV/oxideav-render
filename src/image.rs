@@ -96,7 +96,9 @@ impl RgbaImage {
     pub fn pixels_rgba(&self) -> impl Iterator<Item = [u8; 4]> + '_ {
         let width = self.width as usize;
         self.rows().flat_map(move |row| {
-            row.chunks_exact(4)
+            row.as_chunks::<4>()
+                .0
+                .iter()
                 .take(width)
                 .map(|p| [p[0], p[1], p[2], p[3]])
         })
@@ -237,7 +239,7 @@ mod tests {
             assert_eq!(row.len(), img.stride);
             assert_eq!(row.len(), 12);
             // Each pixel is [0xAA, 0xBB, 0xCC, 0xDD].
-            for chunk in row.chunks_exact(4) {
+            for chunk in row.as_chunks::<4>().0 {
                 assert_eq!(chunk, &[0xAA, 0xBB, 0xCC, 0xDD]);
             }
         }

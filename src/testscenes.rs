@@ -25,7 +25,7 @@ use oxideav_mesh3d::{
 };
 
 use crate::image::RgbaImage;
-use crate::texture::{encode_raw_rgba8, RAW_RGBA8_MIME};
+use crate::texture::{RAW_RGBA8_MIME, encode_raw_rgba8};
 
 // ---------------------------------------------------------------------
 // Geometry builders.
@@ -154,7 +154,7 @@ pub fn checker_rgba8(size: u32, cells: u32, a: [u8; 4], b: [u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let c = if ((x / cell) + (y / cell)) % 2 == 0 {
+            let c = if ((x / cell) + (y / cell)).is_multiple_of(2) {
                 a
             } else {
                 b
@@ -1076,11 +1076,7 @@ pub fn mean_abs_error(a: &RgbaImage, b: &RgbaImage) -> f64 {
             n += 1;
         }
     }
-    if n == 0 {
-        0.0
-    } else {
-        sum as f64 / n as f64
-    }
+    if n == 0 { 0.0 } else { sum as f64 / n as f64 }
 }
 
 /// Peak signal-to-noise ratio in dB over RGB (`f64::INFINITY` for

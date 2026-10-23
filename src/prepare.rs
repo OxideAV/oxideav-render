@@ -577,15 +577,15 @@ impl PreparedScene {
             if let Some(light) = node.light.and_then(|l| scene.lights.get(l.0 as usize)) {
                 lights.push(PreparedLight::from_scene(light, &world, id));
             }
-            if let Some(ci) = node.camera {
-                if let Some(cam) = scene.cameras.get(ci.0 as usize) {
-                    cameras.push(SceneCameraInstance {
-                        node: id,
-                        camera_index: ci.0 as usize,
-                        camera: *cam,
-                        world,
-                    });
-                }
+            if let Some(ci) = node.camera
+                && let Some(cam) = scene.cameras.get(ci.0 as usize)
+            {
+                cameras.push(SceneCameraInstance {
+                    node: id,
+                    camera_index: ci.0 as usize,
+                    camera: *cam,
+                    world,
+                });
             }
             let Some(mesh_id) = node.mesh else { continue };
             let Some(mesh) = scene.meshes.get(mesh_id.0 as usize) else {
@@ -848,7 +848,7 @@ fn flatten_primitive(prim: &Primitive, ctx: FlattenCtx) -> Option<DrawItem> {
             };
             match prim.topology {
                 Topology::Lines => {
-                    for pair in seq.chunks_exact(2) {
+                    for pair in seq.as_chunks::<2>().0 {
                         push(pair[0], pair[1]);
                     }
                 }
@@ -879,18 +879,14 @@ fn flatten_primitive(prim: &Primitive, ctx: FlattenCtx) -> Option<DrawItem> {
                 .iter()
                 .map(|&i| {
                     let n = vec3_normalise(ns[i as usize]);
-                    if finite3(n) {
-                        n
-                    } else {
-                        [0.0, 0.0, 1.0]
-                    }
+                    if finite3(n) { n } else { [0.0, 0.0, 1.0] }
                 })
                 .collect(),
             true,
         ),
         None if topology == DrawTopology::Triangles => {
             let mut out = Vec::with_capacity(positions.len());
-            for t in positions.chunks_exact(3) {
+            for t in positions.as_chunks::<3>().0 {
                 let n = vec3_normalise(vec3_cross(vec3_sub(t[1], t[0]), vec3_sub(t[2], t[0])));
                 out.extend_from_slice(&[n, n, n]);
             }
@@ -922,13 +918,14 @@ fn flatten_primitive(prim: &Primitive, ctx: FlattenCtx) -> Option<DrawItem> {
             .collect(),
         None => Vec::new(),
     };
-    if tangents.is_empty() && ctx.needs_tangents && topology == DrawTopology::Triangles {
-        if let Some(uv) = uvs
+    if tangents.is_empty()
+        && ctx.needs_tangents
+        && topology == DrawTopology::Triangles
+        && let Some(uv) = uvs
             .get(ctx.tangent_uv_set as usize)
             .filter(|u| !u.is_empty())
-        {
-            tangents = face_tangents(&positions, &normals, uv);
-        }
+    {
+        tangents = face_tangents(&positions, &normals, uv);
     }
 
     let colors: Vec<[f32; 4]> = match prim.colors.first() {
@@ -1109,7 +1106,7 @@ mod tests {
         assert_eq!(p.items[1].primitive_count(), 4);
         assert_eq!(p.items[2].primitive_count(), 1);
         // Both strip triangles face +Z.
-        for t in p.items[0].positions.chunks_exact(3) {
+        for t in p.items[0].positions.as_chunks::<3>().0 {
             assert!(vec3_cross(vec3_sub(t[1], t[0]), vec3_sub(t[2], t[0]))[2] > 0.0);
         }
     }

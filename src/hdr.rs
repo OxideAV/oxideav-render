@@ -67,11 +67,7 @@ impl ToneMap {
 }
 
 fn sanitize(v: f32) -> f32 {
-    if v.is_nan() {
-        0.0
-    } else {
-        v
-    }
+    if v.is_nan() { 0.0 } else { v }
 }
 
 fn aces(x: f32) -> f32 {
@@ -182,7 +178,7 @@ impl HdrImage {
     /// `tone_map`, sRGB-encode to bytes. Alpha is quantised linearly.
     pub fn to_rgba8(&self, tone_map: ToneMap, exposure: f32) -> RgbaImage {
         let mut out = Vec::with_capacity(self.pixels.len());
-        for p in self.pixels.chunks_exact(4) {
+        for p in self.pixels.as_chunks::<4>().0 {
             let m = tone_map.apply([p[0] * exposure, p[1] * exposure, p[2] * exposure]);
             out.push(linear_to_srgb_byte(m[0]));
             out.push(linear_to_srgb_byte(m[1]));

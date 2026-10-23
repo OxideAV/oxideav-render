@@ -40,11 +40,7 @@ pub fn v_smith_ggx_correlated(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32 {
     let gv = n_dot_l * (n_dot_v * n_dot_v * (1.0 - a2) + a2).sqrt();
     let gl = n_dot_v * (n_dot_l * n_dot_l * (1.0 - a2) + a2).sqrt();
     let s = gv + gl;
-    if s > 0.0 {
-        0.5 / s
-    } else {
-        0.0
-    }
+    if s > 0.0 { 0.5 / s } else { 0.0 }
 }
 
 /// Schlick Fresnel.

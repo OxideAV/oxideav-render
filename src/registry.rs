@@ -193,8 +193,10 @@ mod tests {
         assert_eq!(img.height, 32);
         let any_drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(
             any_drawn,
             "scanline backend via registry must paint at least one pixel"

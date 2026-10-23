@@ -50,7 +50,7 @@ use std::sync::{Arc, OnceLock};
 
 use oxideav_mesh3d::{AssetSource, ImageData, MagFilter, MinFilter, Sampler, Texture, WrapMode};
 
-use crate::hdr::{srgb_u8_lut, HdrImage};
+use crate::hdr::{HdrImage, srgb_u8_lut};
 
 /// MIME type of the crate's trivial uncompressed RGBA8 container,
 /// decoded natively without any [`TextureResolver`]. Layout: the 8
@@ -221,11 +221,7 @@ fn wrap_index(i: i64, n: i64, mode: WrapMode) -> usize {
         WrapMode::ClampToEdge => i.clamp(0, n - 1),
         WrapMode::MirroredRepeat => {
             let m = i.rem_euclid(2 * n);
-            if m >= n {
-                2 * n - 1 - m
-            } else {
-                m
-            }
+            if m >= n { 2 * n - 1 - m } else { m }
         }
     }) as usize
 }
@@ -270,7 +266,9 @@ fn build_mips(img: &DecodedImage, space: ColorSpace) -> Vec<MipLevel> {
     let lut = srgb_u8_lut();
     let texels: Vec<[f32; 4]> = match &img.pixels {
         DecodedPixels::Rgba8(b) => b
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 let c = |v: u8| match space {
                     ColorSpace::Srgb => lut[v as usize],
@@ -280,7 +278,9 @@ fn build_mips(img: &DecodedImage, space: ColorSpace) -> Vec<MipLevel> {
             })
             .collect(),
         DecodedPixels::RgbaF32(f) => f
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| [p[0], p[1], p[2], p[3]])
             .collect(),
     };
@@ -547,10 +547,10 @@ impl TextureCache {
 
 fn load_source(src: &dyn AssetSource, resolver: &dyn TextureResolver) -> Option<DecodedImage> {
     let mut bytes = Vec::new();
-    if let Some(raw) = src.raw_storage() {
-        if raw.scheme.is_empty() || raw.scheme == "stored" {
-            bytes.extend_from_slice(raw.bytes);
-        }
+    if let Some(raw) = src.raw_storage()
+        && (raw.scheme.is_empty() || raw.scheme == "stored")
+    {
+        bytes.extend_from_slice(raw.bytes);
     }
     if bytes.is_empty() {
         src.open().ok()?.read_to_end(&mut bytes).ok()?;
@@ -676,7 +676,9 @@ pub fn decoded_from_image(img: &oxideav_image::Image) -> Option<DecodedImage> {
             return None;
         }
         let px: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         return DecodedImage::from_rgba_f32(w, h, px);
@@ -695,7 +697,7 @@ impl DecodedImage {
             DecodedPixels::Rgba8(b) => {
                 let lut = srgb_u8_lut();
                 let mut out = Vec::with_capacity(b.len());
-                for p in b.chunks_exact(4) {
+                for p in b.as_chunks::<4>().0 {
                     out.push(lut[p[0] as usize]);
                     out.push(lut[p[1] as usize]);
                     out.push(lut[p[2] as usize]);

@@ -143,7 +143,7 @@ fn rgba_image_to_video_frame(img: RgbaImage, pts: i64) -> VideoFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{make_renderer, BackgroundColor, RenderBackend, ShadingMode};
+    use crate::{BackgroundColor, RenderBackend, ShadingMode, make_renderer};
     use oxideav_core::MediaType;
     use oxideav_mesh3d::{Mesh, MeshId, Node, NodeId, Primitive, Scene3D, Topology};
 
@@ -235,8 +235,10 @@ mod tests {
         };
         let any_drawn = v.planes[0]
             .data
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(
             any_drawn,
             "scanline backend must paint at least one pixel into the VideoFrame"
@@ -272,8 +274,10 @@ mod tests {
         assert_eq!(v.planes[0].data.len(), 32 * 32 * 4);
         let any_drawn = v.planes[0]
             .data
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(
             any_drawn,
             "raycast backend must paint at least one pixel into the VideoFrame"

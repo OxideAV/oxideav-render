@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - The `registry` feature now pulls `oxideav-image` (which brings
   `oxideav-pixfmt`) instead of `oxideav-pixfmt` directly.
 - Dev-dependencies `oxideav-mjpeg` and `oxideav-openexr` (JPEG / EXR

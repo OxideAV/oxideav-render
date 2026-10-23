@@ -45,8 +45,8 @@
 use oxideav_mesh3d::{AlphaMode, Scene3D};
 
 use crate::brdf::{self, BrdfParams};
-use crate::camera::{look_at, orthographic, perspective, Camera};
-use crate::hdr::{linear_to_srgb_byte, srgb_u8_lut, HdrImage};
+use crate::camera::{Camera, look_at, orthographic, perspective};
+use crate::hdr::{HdrImage, linear_to_srgb_byte, srgb_u8_lut};
 use crate::image::RgbaImage;
 use crate::math::{mat4_mul, mat4_mul_vec4, vec3_cross, vec3_dot, vec3_normalise, vec3_sub};
 use crate::options::{Projection, RenderOptions, ShadingMode};
@@ -55,10 +55,10 @@ use crate::prepare::{
     PreparedScene, TextureBinding,
 };
 use crate::raster::{
-    bin_tris, par_bands, raster_visibility, setup_line, setup_point, setup_triangle, Cull,
-    ScreenLine, ScreenTri, VisPixel, LINE_FLAG, NONE,
+    Cull, LINE_FLAG, NONE, ScreenLine, ScreenTri, VisPixel, bin_tris, par_bands, raster_visibility,
+    setup_line, setup_point, setup_triangle,
 };
-use crate::shade::{build_light, shade_pixel, DirLight};
+use crate::shade::{DirLight, build_light, shade_pixel};
 use crate::texture::{ColorSpace, TextureCache};
 
 // ---------------------------------------------------------------------
@@ -285,7 +285,7 @@ fn render_frame(scene: &Scene3D, opts: &RenderOptions, cache: &mut TextureCache)
                     Cull::None
                 };
                 let masked = pbr && matches!(mat.alpha_mode, AlphaMode::Mask { .. });
-                for (t, v) in item.positions.chunks_exact(3).enumerate() {
+                for (t, v) in item.positions.as_chunks::<3>().0.iter().enumerate() {
                     let r = TriRef {
                         item: ii as u32,
                         tri: t as u32,
@@ -617,11 +617,11 @@ impl<'a> ShadeCtx<'a> {
         g: &Grads,
     ) -> [f32; 4] {
         let mut c = mat.base_color;
-        if let Some(bind) = &mat.base_color_texture {
-            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb) {
-                for k in 0..4 {
-                    c[k] *= t[k];
-                }
+        if let Some(bind) = &mat.base_color_texture
+            && let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb)
+        {
+            for k in 0..4 {
+                c[k] *= t[k];
             }
         }
         if !item.colors.is_empty() {
@@ -737,11 +737,7 @@ impl<'a> ShadeCtx<'a> {
         ));
         let mut n = if item.has_vertex_normals {
             let n = vec3_normalise(interp3(&item.normals, base, b));
-            if vec3_dot(n, n) > 0.5 {
-                n
-            } else {
-                ng
-            }
+            if vec3_dot(n, n) > 0.5 { n } else { ng }
         } else {
             ng
         };
@@ -754,60 +750,59 @@ impl<'a> ShadeCtx<'a> {
         // Metallic / roughness.
         let mut metallic = mat.metallic;
         let mut roughness = mat.roughness;
-        if let Some(bind) = &mat.metallic_roughness_texture {
-            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
-                roughness *= t[1];
-                metallic *= t[2];
-            }
+        if let Some(bind) = &mat.metallic_roughness_texture
+            && let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear)
+        {
+            roughness *= t[1];
+            metallic *= t[2];
         }
 
         // Normal map (glTF §3.9.3: tangent-space, +Y up in UV space).
-        if let Some(bind) = &mat.normal_texture {
-            if !item.tangents.is_empty() {
-                if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
-                    let tg = interp4(&item.tangents, base, b);
-                    let w = if item.tangents[base][3] < 0.0 {
-                        -1.0
-                    } else {
-                        1.0
-                    };
-                    let t3 = [tg[0], tg[1], tg[2]];
-                    let d = vec3_dot(n, t3);
-                    let tt = vec3_normalise([t3[0] - n[0] * d, t3[1] - n[1] * d, t3[2] - n[2] * d]);
-                    if vec3_dot(tt, tt) > 0.5 {
-                        let bt = vec3_cross(n, tt);
-                        let bt = [bt[0] * w, bt[1] * w, bt[2] * w];
-                        let s = mat.normal_scale;
-                        let ts = [
-                            (t[0] * 2.0 - 1.0) * s,
-                            (t[1] * 2.0 - 1.0) * s,
-                            t[2] * 2.0 - 1.0,
-                        ];
-                        let nn = vec3_normalise([
-                            tt[0] * ts[0] + bt[0] * ts[1] + n[0] * ts[2],
-                            tt[1] * ts[0] + bt[1] * ts[1] + n[1] * ts[2],
-                            tt[2] * ts[0] + bt[2] * ts[1] + n[2] * ts[2],
-                        ]);
-                        if vec3_dot(nn, nn) > 0.5 {
-                            n = nn;
-                        }
-                    }
+        if let Some(bind) = &mat.normal_texture
+            && !item.tangents.is_empty()
+            && let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear)
+        {
+            let tg = interp4(&item.tangents, base, b);
+            let w = if item.tangents[base][3] < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let t3 = [tg[0], tg[1], tg[2]];
+            let d = vec3_dot(n, t3);
+            let tt = vec3_normalise([t3[0] - n[0] * d, t3[1] - n[1] * d, t3[2] - n[2] * d]);
+            if vec3_dot(tt, tt) > 0.5 {
+                let bt = vec3_cross(n, tt);
+                let bt = [bt[0] * w, bt[1] * w, bt[2] * w];
+                let s = mat.normal_scale;
+                let ts = [
+                    (t[0] * 2.0 - 1.0) * s,
+                    (t[1] * 2.0 - 1.0) * s,
+                    t[2] * 2.0 - 1.0,
+                ];
+                let nn = vec3_normalise([
+                    tt[0] * ts[0] + bt[0] * ts[1] + n[0] * ts[2],
+                    tt[1] * ts[0] + bt[1] * ts[1] + n[1] * ts[2],
+                    tt[2] * ts[0] + bt[2] * ts[1] + n[2] * ts[2],
+                ]);
+                if vec3_dot(nn, nn) > 0.5 {
+                    n = nn;
                 }
             }
         }
 
         let mut ao = 1.0;
-        if let Some(bind) = &mat.occlusion_texture {
-            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear) {
-                ao = 1.0 + mat.occlusion_strength * (t[0] - 1.0);
-            }
+        if let Some(bind) = &mat.occlusion_texture
+            && let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Linear)
+        {
+            ao = 1.0 + mat.occlusion_strength * (t[0] - 1.0);
         }
         let mut emissive = mat.emissive;
-        if let Some(bind) = &mat.emissive_texture {
-            if let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb) {
-                for k in 0..3 {
-                    emissive[k] *= t[k];
-                }
+        if let Some(bind) = &mat.emissive_texture
+            && let Some(t) = self.sample_tex(item, bind, base, b, g, ColorSpace::Srgb)
+        {
+            for k in 0..3 {
+                emissive[k] *= t[k];
             }
         }
 
@@ -1011,7 +1006,7 @@ fn build_shadow_map(
             continue;
         }
         let masked = matches!(mat.alpha_mode, AlphaMode::Mask { .. });
-        for (t, v) in item.positions.chunks_exact(3).enumerate() {
+        for (t, v) in item.positions.as_chunks::<3>().0.iter().enumerate() {
             let id = refs.len() as u32;
             refs.push(TriRef {
                 item: ii as u32,
@@ -1112,8 +1107,10 @@ mod tests {
         assert_eq!(img.pixels.len(), 64 * 64 * 4);
         let drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(drawn, "expected at least one rasterised pixel");
     }
 
@@ -1128,7 +1125,12 @@ mod tests {
             ..RenderOptions::default()
         };
         let img = render_scene(&scene, &opts);
-        let drawn = img.pixels.chunks_exact(4).any(|p| p != [0, 0, 0, 255]);
+        let drawn = img
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [0, 0, 0, 255]);
         assert!(drawn, "wireframe should paint at least one edge pixel");
     }
 
@@ -1137,8 +1139,10 @@ mod tests {
         let img = render_with_mode(ShadingMode::Gouraud);
         let drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(drawn, "gouraud should rasterise the triangle");
     }
 
@@ -1147,8 +1151,10 @@ mod tests {
         let img = render_with_mode(ShadingMode::Phong);
         let drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(drawn, "phong should rasterise the triangle");
     }
 
@@ -1162,7 +1168,7 @@ mod tests {
             ..RenderOptions::default()
         };
         let img = render_scene(&scene, &opts);
-        for px in img.pixels.chunks_exact(4) {
+        for px in img.pixels.as_chunks::<4>().0 {
             assert_eq!(px, &[42, 7, 99, 255]);
         }
     }
@@ -1197,8 +1203,10 @@ mod tests {
         let img = render_with_mode(ShadingMode::NormalDebug);
         let drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(drawn, "normal-debug should rasterise the triangle");
     }
 
@@ -1207,11 +1215,13 @@ mod tests {
         let img = render_with_mode(ShadingMode::DepthDebug);
         let drawn = img
             .pixels
-            .chunks_exact(4)
-            .any(|p| p != [255, 255, 255, 255]);
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| *p != [255, 255, 255, 255]);
         assert!(drawn, "depth-debug should rasterise the triangle");
-        for px in img.pixels.chunks_exact(4) {
-            if px == [255, 255, 255, 255] {
+        for px in img.pixels.as_chunks::<4>().0 {
+            if *px == [255, 255, 255, 255] {
                 continue;
             }
             assert_eq!(px[0], px[1], "depth-debug pixel must be grayscale");
@@ -1269,9 +1279,11 @@ mod tests {
         let img4 = render_scene(&scene, &opts_4);
         let intermediate = |img: &RgbaImage| -> usize {
             img.pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| {
-                    let is_bg = p == &[255, 255, 255, 255];
+                    let is_bg = *p == &[255, 255, 255, 255];
                     let r = p[0];
                     let same = p[0] == p[1] && p[1] == p[2];
                     !is_bg && !(same && (r == 0 || r == 255))

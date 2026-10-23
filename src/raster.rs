@@ -503,10 +503,12 @@ pub(crate) fn par_bands<T: Send>(
         Mutex::new(buf.chunks_mut(chunk).enumerate().rev().collect());
     std::thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| loop {
-                let job = queue.lock().map(|mut q| q.pop()).unwrap_or(None);
-                let Some((i, rows)) = job else { break };
-                f(i, i * BAND_ROWS, rows);
+            s.spawn(|| {
+                loop {
+                    let job = queue.lock().map(|mut q| q.pop()).unwrap_or(None);
+                    let Some((i, rows)) = job else { break };
+                    f(i, i * BAND_ROWS, rows);
+                }
             });
         }
     });

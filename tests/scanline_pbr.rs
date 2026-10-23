@@ -8,8 +8,8 @@ use oxideav_mesh3d::{
 };
 use oxideav_render::testscenes::*;
 use oxideav_render::{
-    make_renderer, BackgroundColor, Camera, DepthRange, PreparedScene, RenderBackend,
-    RenderOptions, RgbaImage, ShadingMode, ToneMap,
+    BackgroundColor, Camera, DepthRange, PreparedScene, RenderBackend, RenderOptions, RgbaImage,
+    ShadingMode, ToneMap, make_renderer,
 };
 
 const BG: [u8; 4] = [0, 0, 0, 255];

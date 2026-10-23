@@ -439,12 +439,12 @@ impl RenderOptions {
                 self.ambient
             )));
         }
-        if let Some(t) = self.time {
-            if !t.is_finite() {
-                return Err(Error::InvalidOptions(format!(
-                    "time must be finite, got {t}"
-                )));
-            }
+        if let Some(t) = self.time
+            && !t.is_finite()
+        {
+            return Err(Error::InvalidOptions(format!(
+                "time must be finite, got {t}"
+            )));
         }
         if !(0.0..=1.0).contains(&self.reflection_roughness_cutoff) {
             return Err(Error::InvalidOptions(format!(

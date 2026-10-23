@@ -6,8 +6,8 @@
 
 use oxideav_render::testscenes::*;
 use oxideav_render::{
-    make_renderer, BackgroundColor, HdrImage, LightSpec, PathTraceOptions, RenderBackend,
-    RenderOptions, ShadingMode,
+    BackgroundColor, HdrImage, LightSpec, PathTraceOptions, RenderBackend, RenderOptions,
+    ShadingMode, make_renderer,
 };
 
 fn opts(w: u32, h: u32, spp: u32, bounces: u32) -> RenderOptions {
@@ -97,7 +97,7 @@ fn iridescent_sphere_tints_a_white_highlight() {
     let saturation = |scene| {
         let img = hdr(&scene, &o);
         let (mut s, mut n) = (0.0f64, 0usize);
-        for p in img.pixels.chunks_exact(4) {
+        for p in img.pixels.as_chunks::<4>().0 {
             let max = p[0].max(p[1]).max(p[2]);
             // Well above the dark sphere's diffuse level (≈ 0.1).
             if max > 0.3 {
@@ -124,7 +124,7 @@ fn backlit_leaf_glows_only_with_diffuse_transmission() {
     let mean = |scene| {
         let img = hdr(&scene, &o);
         let (mut s, mut n) = ([0.0f64; 3], 0usize);
-        for p in img.pixels.chunks_exact(4) {
+        for p in img.pixels.as_chunks::<4>().0 {
             if p[3] > 0.5 {
                 for k in 0..3 {
                     s[k] += p[k] as f64;
@@ -198,7 +198,7 @@ fn showcase_is_deterministic_and_converges() {
         .unwrap();
     assert_eq!(a.pixels, b.pixels);
     assert!(
-        a.pixels.chunks_exact(4).any(|p| p[0] > 10),
+        a.pixels.as_chunks::<4>().0.iter().any(|p| p[0] > 10),
         "something rendered"
     );
     let reference = make_renderer(RenderBackend::PathTrace)

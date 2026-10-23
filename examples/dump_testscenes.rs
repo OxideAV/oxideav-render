@@ -9,8 +9,8 @@
 use oxideav_mesh3d::Sampler;
 use oxideav_render::testscenes::*;
 use oxideav_render::{
-    make_renderer, BackgroundColor, PathTraceOptions, RenderBackend, RenderOptions, ShadingMode,
-    ToneMap,
+    BackgroundColor, PathTraceOptions, RenderBackend, RenderOptions, ShadingMode, ToneMap,
+    make_renderer,
 };
 
 fn main() {

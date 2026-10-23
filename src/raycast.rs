@@ -102,19 +102,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use oxideav_mesh3d::{AlphaMode, BvhBuildOptions, Scene3D};
 
-use crate::brdf::{f_schlick, BrdfParams};
+use crate::brdf::{BrdfParams, f_schlick};
 use crate::camera::Camera;
-use crate::hdr::{srgb_u8_lut, HdrImage};
+use crate::hdr::{HdrImage, srgb_u8_lut};
 use crate::image::RgbaImage;
 use crate::math::{vec3_dot, vec3_normalise, vec3_scale};
 use crate::options::{RenderOptions, ShadingMode};
 use crate::prepare::{PrepareOptions, PreparedScene};
-use crate::scanline::{depth_to_byte, normal_to_byte, Frame, Sample};
-use crate::shade::{build_light, shade_pixel, DirLight, AMBIENT};
+use crate::scanline::{Frame, Sample, depth_to_byte, normal_to_byte};
+use crate::shade::{AMBIENT, DirLight, build_light, shade_pixel};
 use crate::texture::TextureCache;
 use crate::trace::{
-    interp3, offset_ray_origin, pixel_spread, reflect, refract, schlick, TexLod, TraceHit,
-    TraceScene,
+    TexLod, TraceHit, TraceScene, interp3, offset_ray_origin, pixel_spread, reflect, refract,
+    schlick,
 };
 
 /// Hard cap on [`RenderOptions::max_ray_depth`].
@@ -811,7 +811,12 @@ mod tests {
     }
 
     fn non_bg_count(img: &RgbaImage, bg: [u8; 4]) -> usize {
-        img.pixels.chunks_exact(4).filter(|p| *p != bg).count()
+        img.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != bg)
+            .count()
     }
 
     #[test]
@@ -842,7 +847,7 @@ mod tests {
             ..RenderOptions::default()
         };
         let img = render_scene(&scene, &opts);
-        for px in img.pixels.chunks_exact(4) {
+        for px in img.pixels.as_chunks::<4>().0 {
             assert_eq!(px, &[42, 7, 99, 255]);
         }
     }
@@ -883,11 +888,13 @@ mod tests {
         let mut only_one = 0usize;
         for (r, s) in ray_img
             .pixels
-            .chunks_exact(4)
-            .zip(scan_img.pixels.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(scan_img.pixels.as_chunks::<4>().0)
         {
-            let rp = r != [255, 255, 255, 255];
-            let sp = s != [255, 255, 255, 255];
+            let rp = *r != [255, 255, 255, 255];
+            let sp = *s != [255, 255, 255, 255];
             if rp && sp {
                 both += 1;
             } else if rp != sp {
@@ -920,8 +927,11 @@ mod tests {
         let expected = linear_rgba_to_srgb_u8([0.7, 0.7, 0.75, 1.0]);
         let painted: Vec<&[u8]> = img
             .pixels
-            .chunks_exact(4)
-            .filter(|p| *p != [255, 255, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != [255, 255, 255, 255])
+            .map(|c| c.as_slice())
             .collect();
         assert!(!painted.is_empty());
         for p in painted {
@@ -1019,7 +1029,7 @@ mod tests {
         };
         let img = render_scene(&scene, &opts);
         let expected = linear_rgba_to_srgb_u8([1.0, 0.0, 0.0, 1.0]);
-        let hit_red = img.pixels.chunks_exact(4).any(|p| p == expected);
+        let hit_red = img.pixels.as_chunks::<4>().0.contains(&expected);
         assert!(hit_red, "material base colour must reach the framebuffer");
     }
 
@@ -1087,8 +1097,10 @@ mod tests {
         let flat = linear_rgba_to_srgb_u8([0.7, 0.7, 0.75, 1.0]);
         let painted: Vec<[u8; 4]> = img
             .pixels
-            .chunks_exact(4)
-            .filter(|p| *p != [255, 255, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != [255, 255, 255, 255])
             .map(|p| [p[0], p[1], p[2], p[3]])
             .collect();
         assert!(!painted.is_empty());
@@ -1206,8 +1218,10 @@ mod tests {
 
         let min_luma = |img: &RgbaImage| -> u8 {
             img.pixels
-                .chunks_exact(4)
-                .filter(|p| *p != bg)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| **p != bg)
                 .map(|p| p[0])
                 .min()
                 .unwrap_or(255)
@@ -1452,8 +1466,10 @@ mod tests {
         let expected = linear_rgba_to_srgb_u8(base);
         let unlit_painted: Vec<[u8; 4]> = unlit_img
             .pixels
-            .chunks_exact(4)
-            .filter(|p| *p != [255, 255, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != [255, 255, 255, 255])
             .map(|p| [p[0], p[1], p[2], p[3]])
             .collect();
         assert!(!unlit_painted.is_empty());
@@ -1462,8 +1478,10 @@ mod tests {
         }
         let lit_darker = lit_img
             .pixels
-            .chunks_exact(4)
-            .filter(|p| *p != [255, 255, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != [255, 255, 255, 255])
             .all(|p| p[1] < expected[1]);
         assert!(
             lit_darker,
@@ -1510,8 +1528,10 @@ mod tests {
         let dim = render_mat(emissive_mat(Some(0.5)));
         let max_red = |img: &RgbaImage| -> u8 {
             img.pixels
-                .chunks_exact(4)
-                .filter(|p| *p != [255, 255, 255, 255])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| **p != [255, 255, 255, 255])
                 .map(|p| p[0])
                 .max()
                 .unwrap_or(0)
@@ -1529,8 +1549,10 @@ mod tests {
         // emission is pure red).
         let clean_channels = full
             .pixels
-            .chunks_exact(4)
-            .filter(|p| *p != [255, 255, 255, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != [255, 255, 255, 255])
             .all(|p| p[1] == 0 && p[2] == 0);
         assert!(clean_channels, "emission must not leak across channels");
     }

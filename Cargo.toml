@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-render"
 version = "0.0.5"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust 3D-scene → raster image/video renderer scaffold for the oxideav framework — Phase 1 Renderer trait + RenderBackend stub. Scanline rasteriser migration and a future raycaster live behind a single trait surface."

@@ -8,14 +8,14 @@
 use std::sync::Arc;
 
 use oxideav_core::{PixelFormat, RuntimeContext};
-use oxideav_image::{encode, Image, SaveOptions};
+use oxideav_image::{Image, SaveOptions, encode};
 use oxideav_mesh3d::{MagFilter, MinFilter, Sampler, Scene3D, Texture};
 use oxideav_render::testscenes::*;
 use oxideav_render::texture::{DecodedPixels, TextureCache};
 use oxideav_render::{
-    make_renderer, BackgroundColor, Camera, DepthRange, EnvironmentMap, ImageTextureResolver,
-    LightSpec, PathTraceOptions, PathTracer, PreparedScene, RenderBackend, RenderOptions,
-    RgbaImage, ShadingMode, TextureResolver,
+    BackgroundColor, Camera, DepthRange, EnvironmentMap, ImageTextureResolver, LightSpec,
+    PathTraceOptions, PathTracer, PreparedScene, RenderBackend, RenderOptions, RgbaImage,
+    ShadingMode, TextureResolver, make_renderer,
 };
 
 const BG: [u8; 4] = [0, 0, 0, 255];
@@ -92,7 +92,9 @@ fn checker_encoded(ctx: &RuntimeContext, format: &str) -> (Vec<u8>, &'static str
             // cells on a 64×64 image put every 16×16 chroma block
             // inside one flat cell.
             let rgb: Vec<u8> = checker_rgba8(64, 4, [255, 0, 0, 255], [0, 0, 255, 255])
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2]])
                 .collect();
             (Image::from_rgb8(64, 64, rgb).unwrap(), "image/jpeg")
@@ -100,7 +102,7 @@ fn checker_encoded(ctx: &RuntimeContext, format: &str) -> (Vec<u8>, &'static str
         "exr" => {
             // Scene-linear float: pure red / blue at 1.0, opaque.
             let mut f = Vec::with_capacity(4 * 4 * 16);
-            for p in rgba.chunks_exact(4) {
+            for p in rgba.as_chunks::<4>().0 {
                 for c in p {
                     f.extend_from_slice(&(*c as f32 / 255.0).to_le_bytes());
                 }
@@ -315,9 +317,12 @@ fn float_sources_decode_linear_and_integer_sources_rgba8() {
     match &dec.pixels {
         DecodedPixels::Rgba8(p) => {
             assert_eq!(p.len(), 8 * 8 * 4);
-            assert!(p
-                .chunks_exact(4)
-                .all(|q| q[3] == 255 && q[0].abs_diff(200) <= 3));
+            assert!(
+                p.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|q| q[3] == 255 && q[0].abs_diff(200) <= 3)
+            );
         }
         other => panic!("JPEG must decode to Rgba8, got {other:?}"),
     }
@@ -333,12 +338,14 @@ fn gateway_errors_are_typed_and_the_cache_memoises_them() {
         r.decode_image(b"not an image at all", None),
         Err(oxideav_image::ImageError::UnknownFormat(_))
     ));
-    assert!(r
-        .decode_image(b"not an image at all", Some("image/png"))
-        .is_err());
-    assert!(r
-        .decode(b"not an image at all", Some("image/png"))
-        .is_none());
+    assert!(
+        r.decode_image(b"not an image at all", Some("image/png"))
+            .is_err()
+    );
+    assert!(
+        r.decode(b"not an image at all", Some("image/png"))
+            .is_none()
+    );
     // Over the pixel budget: refused before decoding.
     let big = encode(
         &ctx,
@@ -454,7 +461,7 @@ fn exr_environment_map_lights_the_path_tracer() {
     let mean = |h: &oxideav_render::HdrImage| {
         let mut s = 0.0f64;
         let mut n = 0usize;
-        for p in h.pixels.chunks_exact(4) {
+        for p in h.pixels.as_chunks::<4>().0 {
             if p[3] > 0.5 {
                 s += (p[0] + p[1] + p[2]) as f64 / 3.0;
                 n += 1;
