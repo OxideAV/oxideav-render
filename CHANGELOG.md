@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-render/compare/v0.0.6...v0.0.7) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive prepared/trace records + option builders
+
 ### Added
 
 - `Default` on the prepared / trace records whose fields all have one; full-field `new` on `DrawItem`, `PreparedLight`, `SceneCameraInstance`, `DecodedImage`, `PreparedTexture` and `CameraSpec`; `with_<field>` setters on every newly `#[non_exhaustive]` record and on `RenderOptions`, `PathTraceOptions`, `LightSpec` and `CameraSpec` so callers can migrate off struct literals.
