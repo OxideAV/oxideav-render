@@ -88,6 +88,50 @@ pub struct PathTraceOptions {
     pub strategy: LightStrategy,
 }
 
+impl PathTraceOptions {
+    /// Set `samples_per_pixel`.
+    #[must_use]
+    pub fn with_samples_per_pixel(mut self, v: u32) -> Self {
+        self.samples_per_pixel = v;
+        self
+    }
+
+    /// Set `max_bounces`.
+    #[must_use]
+    pub fn with_max_bounces(mut self, v: u32) -> Self {
+        self.max_bounces = v;
+        self
+    }
+
+    /// Set `rr_start`.
+    #[must_use]
+    pub fn with_rr_start(mut self, v: u32) -> Self {
+        self.rr_start = v;
+        self
+    }
+
+    /// Set `clamp`.
+    #[must_use]
+    pub fn with_clamp(mut self, v: f32) -> Self {
+        self.clamp = v;
+        self
+    }
+
+    /// Set `seed`.
+    #[must_use]
+    pub fn with_seed(mut self, v: u32) -> Self {
+        self.seed = v;
+        self
+    }
+
+    /// Set `strategy`.
+    #[must_use]
+    pub fn with_strategy(mut self, v: LightStrategy) -> Self {
+        self.strategy = v;
+        self
+    }
+}
+
 impl Default for PathTraceOptions {
     fn default() -> Self {
         Self {
@@ -182,6 +226,29 @@ pub struct LightSpec {
 }
 
 impl LightSpec {
+    /// Set `azimuth_deg`.
+    #[must_use]
+    pub fn with_azimuth_deg(mut self, v: f32) -> Self {
+        self.azimuth_deg = v;
+        self
+    }
+
+    /// Set `elevation_deg`.
+    #[must_use]
+    pub fn with_elevation_deg(mut self, v: f32) -> Self {
+        self.elevation_deg = v;
+        self
+    }
+
+    /// Set `intensity`.
+    #[must_use]
+    pub fn with_intensity(mut self, v: f32) -> Self {
+        self.intensity = v;
+        self
+    }
+}
+
+impl LightSpec {
     /// Default directional light: from the upper-right-front quadrant
     /// at unit intensity. Matches the renderer baseline so callers
     /// never have to specify a light explicitly.
@@ -217,6 +284,38 @@ pub struct CameraSpec {
     /// Distance from the scene center, in units of the auto-frame
     /// bounding-sphere distance. Must be `> 0` and finite.
     pub distance: f32,
+}
+
+impl CameraSpec {
+    /// Build a `CameraSpec` from its mandatory fields.
+    pub fn new(elevation_deg: f32, azimuth_deg: f32, distance: f32) -> Self {
+        Self {
+            elevation_deg,
+            azimuth_deg,
+            distance,
+        }
+    }
+
+    /// Set `elevation_deg`.
+    #[must_use]
+    pub fn with_elevation_deg(mut self, v: f32) -> Self {
+        self.elevation_deg = v;
+        self
+    }
+
+    /// Set `azimuth_deg`.
+    #[must_use]
+    pub fn with_azimuth_deg(mut self, v: f32) -> Self {
+        self.azimuth_deg = v;
+        self
+    }
+
+    /// Set `distance`.
+    #[must_use]
+    pub fn with_distance(mut self, v: f32) -> Self {
+        self.distance = v;
+        self
+    }
 }
 
 /// Caller-facing render options. The renderer interprets each field
@@ -312,6 +411,169 @@ pub struct RenderOptions {
     /// Path-tracer controls (sample count, bounces, clamp, seed);
     /// ignored by the other backends.
     pub path_trace: PathTraceOptions,
+}
+
+impl RenderOptions {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `background`.
+    #[must_use]
+    pub fn with_background(mut self, v: BackgroundColor) -> Self {
+        self.background = v;
+        self
+    }
+
+    /// Set `shading`.
+    #[must_use]
+    pub fn with_shading(mut self, v: ShadingMode) -> Self {
+        self.shading = v;
+        self
+    }
+
+    /// Set `projection`.
+    #[must_use]
+    pub fn with_projection(mut self, v: Projection) -> Self {
+        self.projection = v;
+        self
+    }
+
+    /// Set `fov_deg`.
+    #[must_use]
+    pub fn with_fov_deg(mut self, v: f32) -> Self {
+        self.fov_deg = v;
+        self
+    }
+
+    /// Set `light`.
+    #[must_use]
+    pub fn with_light(mut self, v: LightSpec) -> Self {
+        self.light = v;
+        self
+    }
+
+    /// Set `camera`.
+    #[must_use]
+    pub fn with_camera(mut self, v: Option<CameraSpec>) -> Self {
+        self.camera = v;
+        self
+    }
+
+    /// Set `camera_target_offset`.
+    #[must_use]
+    pub fn with_camera_target_offset(mut self, v: [f32; 3]) -> Self {
+        self.camera_target_offset = v;
+        self
+    }
+
+    /// Set `aa`.
+    #[must_use]
+    pub fn with_aa(mut self, v: u32) -> Self {
+        self.aa = v;
+        self
+    }
+
+    /// Set `tone_map`.
+    #[must_use]
+    pub fn with_tone_map(mut self, v: ToneMap) -> Self {
+        self.tone_map = v;
+        self
+    }
+
+    /// Set `exposure`.
+    #[must_use]
+    pub fn with_exposure(mut self, v: f32) -> Self {
+        self.exposure = v;
+        self
+    }
+
+    /// Set `time`.
+    #[must_use]
+    pub fn with_time(mut self, v: Option<f32>) -> Self {
+        self.time = v;
+        self
+    }
+
+    /// Set `animation`.
+    #[must_use]
+    pub fn with_animation(mut self, v: Option<usize>) -> Self {
+        self.animation = v;
+        self
+    }
+
+    /// Set `scene_camera`.
+    #[must_use]
+    pub fn with_scene_camera(mut self, v: Option<usize>) -> Self {
+        self.scene_camera = v;
+        self
+    }
+
+    /// Set `use_scene_lights`.
+    #[must_use]
+    pub fn with_use_scene_lights(mut self, v: bool) -> Self {
+        self.use_scene_lights = v;
+        self
+    }
+
+    /// Set `ambient`.
+    #[must_use]
+    pub fn with_ambient(mut self, v: f32) -> Self {
+        self.ambient = v;
+        self
+    }
+
+    /// Set `shadows`.
+    #[must_use]
+    pub fn with_shadows(mut self, v: bool) -> Self {
+        self.shadows = v;
+        self
+    }
+
+    /// Set `shadow_map_size`.
+    #[must_use]
+    pub fn with_shadow_map_size(mut self, v: u32) -> Self {
+        self.shadow_map_size = v;
+        self
+    }
+
+    /// Set `material_variant`.
+    #[must_use]
+    pub fn with_material_variant(mut self, v: Option<usize>) -> Self {
+        self.material_variant = v;
+        self
+    }
+
+    /// Set `max_ray_depth`.
+    #[must_use]
+    pub fn with_max_ray_depth(mut self, v: u32) -> Self {
+        self.max_ray_depth = v;
+        self
+    }
+
+    /// Set `reflection_roughness_cutoff`.
+    #[must_use]
+    pub fn with_reflection_roughness_cutoff(mut self, v: f32) -> Self {
+        self.reflection_roughness_cutoff = v;
+        self
+    }
+
+    /// Set `path_trace`.
+    #[must_use]
+    pub fn with_path_trace(mut self, v: PathTraceOptions) -> Self {
+        self.path_trace = v;
+        self
+    }
 }
 
 impl Default for RenderOptions {

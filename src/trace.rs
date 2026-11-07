@@ -48,7 +48,8 @@ pub struct TriRef {
 }
 
 /// A ray / triangle intersection.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct TraceHit {
     /// Ray parameter (world distance for a unit direction).
     pub t: f32,
@@ -64,8 +65,53 @@ pub struct TraceHit {
     pub front_face: bool,
 }
 
+impl TraceHit {
+    /// Set `t`.
+    #[must_use]
+    pub fn with_t(mut self, v: f32) -> Self {
+        self.t = v;
+        self
+    }
+
+    /// Set `global`.
+    #[must_use]
+    pub fn with_global(mut self, v: u32) -> Self {
+        self.global = v;
+        self
+    }
+
+    /// Set `item`.
+    #[must_use]
+    pub fn with_item(mut self, v: u32) -> Self {
+        self.item = v;
+        self
+    }
+
+    /// Set `tri`.
+    #[must_use]
+    pub fn with_tri(mut self, v: u32) -> Self {
+        self.tri = v;
+        self
+    }
+
+    /// Set `barycentric`.
+    #[must_use]
+    pub fn with_barycentric(mut self, v: [f32; 3]) -> Self {
+        self.barycentric = v;
+        self
+    }
+
+    /// Set `front_face`.
+    #[must_use]
+    pub fn with_front_face(mut self, v: bool) -> Self {
+        self.front_face = v;
+        self
+    }
+}
+
 /// Interpolated geometry at a hit.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Surface {
     /// World hit position (barycentric reconstruction — more precise
     /// than `o + t·d`).
@@ -82,8 +128,46 @@ pub struct Surface {
     pub material: usize,
 }
 
+impl Surface {
+    /// Set `position`.
+    #[must_use]
+    pub fn with_position(mut self, v: [f32; 3]) -> Self {
+        self.position = v;
+        self
+    }
+
+    /// Set `geometric_normal`.
+    #[must_use]
+    pub fn with_geometric_normal(mut self, v: [f32; 3]) -> Self {
+        self.geometric_normal = v;
+        self
+    }
+
+    /// Set `shading_normal`.
+    #[must_use]
+    pub fn with_shading_normal(mut self, v: [f32; 3]) -> Self {
+        self.shading_normal = v;
+        self
+    }
+
+    /// Set `area`.
+    #[must_use]
+    pub fn with_area(mut self, v: f32) -> Self {
+        self.area = v;
+        self
+    }
+
+    /// Set `material`.
+    #[must_use]
+    pub fn with_material(mut self, v: usize) -> Self {
+        self.material = v;
+        self
+    }
+}
+
 /// Texture level-of-detail selection for material evaluation.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum TexLod {
     /// Sample mip level 0 (magnification filter).
     Base,

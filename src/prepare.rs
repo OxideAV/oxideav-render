@@ -58,6 +58,7 @@ use crate::texture::{PreparedTexture, TextureCache};
 
 /// Inputs to [`PreparedScene::build`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PrepareOptions {
     /// Animation time in seconds. `None` = rest pose.
     pub time: Option<f32>,
@@ -72,6 +73,50 @@ pub struct PrepareOptions {
     pub fallback_light: Option<LightSpec>,
     /// Generate tangents for normal-mapped primitives lacking them.
     pub generate_tangents: bool,
+}
+
+impl PrepareOptions {
+    /// Set `time`.
+    #[must_use]
+    pub fn with_time(mut self, v: Option<f32>) -> Self {
+        self.time = v;
+        self
+    }
+
+    /// Set `animation`.
+    #[must_use]
+    pub fn with_animation(mut self, v: Option<usize>) -> Self {
+        self.animation = v;
+        self
+    }
+
+    /// Set `material_variant`.
+    #[must_use]
+    pub fn with_material_variant(mut self, v: Option<usize>) -> Self {
+        self.material_variant = v;
+        self
+    }
+
+    /// Set `use_scene_lights`.
+    #[must_use]
+    pub fn with_use_scene_lights(mut self, v: bool) -> Self {
+        self.use_scene_lights = v;
+        self
+    }
+
+    /// Set `fallback_light`.
+    #[must_use]
+    pub fn with_fallback_light(mut self, v: Option<LightSpec>) -> Self {
+        self.fallback_light = v;
+        self
+    }
+
+    /// Set `generate_tangents`.
+    #[must_use]
+    pub fn with_generate_tangents(mut self, v: bool) -> Self {
+        self.generate_tangents = v;
+        self
+    }
 }
 
 impl Default for PrepareOptions {
@@ -107,6 +152,7 @@ impl PrepareOptions {
 
 /// Primitive class of a [`DrawItem`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DrawTopology {
     /// Unindexed triangle list — 3 vertices per triangle, CCW front.
     Triangles,
@@ -120,6 +166,7 @@ pub enum DrawTopology {
 /// vertex streams. Every non-empty attribute vector has exactly
 /// `positions.len()` entries.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DrawItem {
     /// Scene node instancing the mesh.
     pub node: NodeId,
@@ -164,6 +211,160 @@ pub struct DrawItem {
 }
 
 impl DrawItem {
+    /// Build a `DrawItem` from every field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node: NodeId,
+        mesh: MeshId,
+        primitive: usize,
+        topology: DrawTopology,
+        world: [[f32; 4]; 4],
+        normal_matrix: [[f32; 3]; 3],
+        skinned: bool,
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        has_vertex_normals: bool,
+        tangents: Vec<[f32; 4]>,
+        uvs: Vec<Vec<[f32; 2]>>,
+        colors: Vec<[f32; 4]>,
+        material: usize,
+        bounds_min: [f32; 3],
+        bounds_max: [f32; 3],
+    ) -> Self {
+        Self {
+            node,
+            mesh,
+            primitive,
+            topology,
+            world,
+            normal_matrix,
+            skinned,
+            positions,
+            normals,
+            has_vertex_normals,
+            tangents,
+            uvs,
+            colors,
+            material,
+            bounds_min,
+            bounds_max,
+        }
+    }
+
+    /// Set `node`.
+    #[must_use]
+    pub fn with_node(mut self, v: NodeId) -> Self {
+        self.node = v;
+        self
+    }
+
+    /// Set `mesh`.
+    #[must_use]
+    pub fn with_mesh(mut self, v: MeshId) -> Self {
+        self.mesh = v;
+        self
+    }
+
+    /// Set `primitive`.
+    #[must_use]
+    pub fn with_primitive(mut self, v: usize) -> Self {
+        self.primitive = v;
+        self
+    }
+
+    /// Set `topology`.
+    #[must_use]
+    pub fn with_topology(mut self, v: DrawTopology) -> Self {
+        self.topology = v;
+        self
+    }
+
+    /// Set `world`.
+    #[must_use]
+    pub fn with_world(mut self, v: [[f32; 4]; 4]) -> Self {
+        self.world = v;
+        self
+    }
+
+    /// Set `normal_matrix`.
+    #[must_use]
+    pub fn with_normal_matrix(mut self, v: [[f32; 3]; 3]) -> Self {
+        self.normal_matrix = v;
+        self
+    }
+
+    /// Set `skinned`.
+    #[must_use]
+    pub fn with_skinned(mut self, v: bool) -> Self {
+        self.skinned = v;
+        self
+    }
+
+    /// Set `positions`.
+    #[must_use]
+    pub fn with_positions(mut self, v: Vec<[f32; 3]>) -> Self {
+        self.positions = v;
+        self
+    }
+
+    /// Set `normals`.
+    #[must_use]
+    pub fn with_normals(mut self, v: Vec<[f32; 3]>) -> Self {
+        self.normals = v;
+        self
+    }
+
+    /// Set `has_vertex_normals`.
+    #[must_use]
+    pub fn with_has_vertex_normals(mut self, v: bool) -> Self {
+        self.has_vertex_normals = v;
+        self
+    }
+
+    /// Set `tangents`.
+    #[must_use]
+    pub fn with_tangents(mut self, v: Vec<[f32; 4]>) -> Self {
+        self.tangents = v;
+        self
+    }
+
+    /// Set `uvs`.
+    #[must_use]
+    pub fn with_uvs(mut self, v: Vec<Vec<[f32; 2]>>) -> Self {
+        self.uvs = v;
+        self
+    }
+
+    /// Set `colors`.
+    #[must_use]
+    pub fn with_colors(mut self, v: Vec<[f32; 4]>) -> Self {
+        self.colors = v;
+        self
+    }
+
+    /// Set `material`.
+    #[must_use]
+    pub fn with_material(mut self, v: usize) -> Self {
+        self.material = v;
+        self
+    }
+
+    /// Set `bounds_min`.
+    #[must_use]
+    pub fn with_bounds_min(mut self, v: [f32; 3]) -> Self {
+        self.bounds_min = v;
+        self
+    }
+
+    /// Set `bounds_max`.
+    #[must_use]
+    pub fn with_bounds_max(mut self, v: [f32; 3]) -> Self {
+        self.bounds_max = v;
+        self
+    }
+}
+
+impl DrawItem {
     /// Number of triangles / segments / points.
     pub fn primitive_count(&self) -> usize {
         match self.topology {
@@ -184,7 +385,8 @@ impl DrawItem {
 
 /// A texture reference resolved against [`PreparedScene::textures`].
 /// Only emitted when the texture decoded successfully.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct TextureBinding {
     /// Index into [`PreparedScene::textures`] (`Some` there).
     pub texture: usize,
@@ -193,6 +395,29 @@ pub struct TextureBinding {
     pub uv_set: u32,
     /// `KHR_texture_transform` (`None` = identity).
     pub transform: Option<TextureTransform>,
+}
+
+impl TextureBinding {
+    /// Set `texture`.
+    #[must_use]
+    pub fn with_texture(mut self, v: usize) -> Self {
+        self.texture = v;
+        self
+    }
+
+    /// Set `uv_set`.
+    #[must_use]
+    pub fn with_uv_set(mut self, v: u32) -> Self {
+        self.uv_set = v;
+        self
+    }
+
+    /// Set `transform`.
+    #[must_use]
+    pub fn with_transform(mut self, v: Option<TextureTransform>) -> Self {
+        self.transform = v;
+        self
+    }
 }
 
 impl TextureBinding {
@@ -207,7 +432,8 @@ impl TextureBinding {
 
 /// glTF metallic-roughness material with factors resolved and
 /// textures bound to the prepared texture table.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct PreparedMaterial {
     /// Source material (`None` for the default material).
     pub source: Option<MaterialId>,
@@ -247,6 +473,127 @@ pub struct PreparedMaterial {
     /// transmission, volume, …) for backends that model them. Texture
     /// references inside are *unresolved* scene texture ids.
     pub ext: MaterialExt,
+}
+
+impl PreparedMaterial {
+    /// Set `source`.
+    #[must_use]
+    pub fn with_source(mut self, v: Option<MaterialId>) -> Self {
+        self.source = v;
+        self
+    }
+
+    /// Set `base_color`.
+    #[must_use]
+    pub fn with_base_color(mut self, v: [f32; 4]) -> Self {
+        self.base_color = v;
+        self
+    }
+
+    /// Set `base_color_texture`.
+    #[must_use]
+    pub fn with_base_color_texture(mut self, v: Option<TextureBinding>) -> Self {
+        self.base_color_texture = v;
+        self
+    }
+
+    /// Set `metallic`.
+    #[must_use]
+    pub fn with_metallic(mut self, v: f32) -> Self {
+        self.metallic = v;
+        self
+    }
+
+    /// Set `roughness`.
+    #[must_use]
+    pub fn with_roughness(mut self, v: f32) -> Self {
+        self.roughness = v;
+        self
+    }
+
+    /// Set `metallic_roughness_texture`.
+    #[must_use]
+    pub fn with_metallic_roughness_texture(mut self, v: Option<TextureBinding>) -> Self {
+        self.metallic_roughness_texture = v;
+        self
+    }
+
+    /// Set `normal_texture`.
+    #[must_use]
+    pub fn with_normal_texture(mut self, v: Option<TextureBinding>) -> Self {
+        self.normal_texture = v;
+        self
+    }
+
+    /// Set `normal_scale`.
+    #[must_use]
+    pub fn with_normal_scale(mut self, v: f32) -> Self {
+        self.normal_scale = v;
+        self
+    }
+
+    /// Set `occlusion_texture`.
+    #[must_use]
+    pub fn with_occlusion_texture(mut self, v: Option<TextureBinding>) -> Self {
+        self.occlusion_texture = v;
+        self
+    }
+
+    /// Set `occlusion_strength`.
+    #[must_use]
+    pub fn with_occlusion_strength(mut self, v: f32) -> Self {
+        self.occlusion_strength = v;
+        self
+    }
+
+    /// Set `emissive`.
+    #[must_use]
+    pub fn with_emissive(mut self, v: [f32; 3]) -> Self {
+        self.emissive = v;
+        self
+    }
+
+    /// Set `emissive_texture`.
+    #[must_use]
+    pub fn with_emissive_texture(mut self, v: Option<TextureBinding>) -> Self {
+        self.emissive_texture = v;
+        self
+    }
+
+    /// Set `alpha_mode`.
+    #[must_use]
+    pub fn with_alpha_mode(mut self, v: AlphaMode) -> Self {
+        self.alpha_mode = v;
+        self
+    }
+
+    /// Set `double_sided`.
+    #[must_use]
+    pub fn with_double_sided(mut self, v: bool) -> Self {
+        self.double_sided = v;
+        self
+    }
+
+    /// Set `unlit`.
+    #[must_use]
+    pub fn with_unlit(mut self, v: bool) -> Self {
+        self.unlit = v;
+        self
+    }
+
+    /// Set `ior`.
+    #[must_use]
+    pub fn with_ior(mut self, v: f32) -> Self {
+        self.ior = v;
+        self
+    }
+
+    /// Set `ext`.
+    #[must_use]
+    pub fn with_ext(mut self, v: MaterialExt) -> Self {
+        self.ext = v;
+        self
+    }
 }
 
 impl PreparedMaterial {
@@ -343,6 +690,7 @@ pub enum LightKind {
 
 /// A light placed in world space.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct PreparedLight {
     /// Light class.
     pub kind: LightKind,
@@ -365,8 +713,100 @@ pub struct PreparedLight {
     pub node: Option<NodeId>,
 }
 
+impl PreparedLight {
+    /// Build a `PreparedLight` from every field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: LightKind,
+        color: [f32; 3],
+        intensity: f32,
+        position: [f32; 3],
+        direction: [f32; 3],
+        range: Option<f32>,
+        inner_cone_angle: f32,
+        outer_cone_angle: f32,
+        node: Option<NodeId>,
+    ) -> Self {
+        Self {
+            kind,
+            color,
+            intensity,
+            position,
+            direction,
+            range,
+            inner_cone_angle,
+            outer_cone_angle,
+            node,
+        }
+    }
+
+    /// Set `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, v: LightKind) -> Self {
+        self.kind = v;
+        self
+    }
+
+    /// Set `color`.
+    #[must_use]
+    pub fn with_color(mut self, v: [f32; 3]) -> Self {
+        self.color = v;
+        self
+    }
+
+    /// Set `intensity`.
+    #[must_use]
+    pub fn with_intensity(mut self, v: f32) -> Self {
+        self.intensity = v;
+        self
+    }
+
+    /// Set `position`.
+    #[must_use]
+    pub fn with_position(mut self, v: [f32; 3]) -> Self {
+        self.position = v;
+        self
+    }
+
+    /// Set `direction`.
+    #[must_use]
+    pub fn with_direction(mut self, v: [f32; 3]) -> Self {
+        self.direction = v;
+        self
+    }
+
+    /// Set `range`.
+    #[must_use]
+    pub fn with_range(mut self, v: Option<f32>) -> Self {
+        self.range = v;
+        self
+    }
+
+    /// Set `inner_cone_angle`.
+    #[must_use]
+    pub fn with_inner_cone_angle(mut self, v: f32) -> Self {
+        self.inner_cone_angle = v;
+        self
+    }
+
+    /// Set `outer_cone_angle`.
+    #[must_use]
+    pub fn with_outer_cone_angle(mut self, v: f32) -> Self {
+        self.outer_cone_angle = v;
+        self
+    }
+
+    /// Set `node`.
+    #[must_use]
+    pub fn with_node(mut self, v: Option<NodeId>) -> Self {
+        self.node = v;
+        self
+    }
+}
+
 /// Light arriving at a shading point.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct LightSample {
     /// Unit vector from the shading point toward the light.
     pub l: [f32; 3],
@@ -375,6 +815,29 @@ pub struct LightSample {
     /// Incident irradiance on a surface facing the light
     /// (`color · intensity · attenuation`), before the `N·L` cosine.
     pub radiance: [f32; 3],
+}
+
+impl LightSample {
+    /// Set `l`.
+    #[must_use]
+    pub fn with_l(mut self, v: [f32; 3]) -> Self {
+        self.l = v;
+        self
+    }
+
+    /// Set `distance`.
+    #[must_use]
+    pub fn with_distance(mut self, v: f32) -> Self {
+        self.distance = v;
+        self
+    }
+
+    /// Set `radiance`.
+    #[must_use]
+    pub fn with_radiance(mut self, v: [f32; 3]) -> Self {
+        self.radiance = v;
+        self
+    }
 }
 
 impl PreparedLight {
@@ -502,6 +965,7 @@ impl PreparedLight {
 
 /// A scene camera placed by a node.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SceneCameraInstance {
     /// Node carrying the camera.
     pub node: NodeId,
@@ -513,8 +977,54 @@ pub struct SceneCameraInstance {
     pub world: [[f32; 4]; 4],
 }
 
+impl SceneCameraInstance {
+    /// Build a `SceneCameraInstance` from every field.
+    pub fn new(
+        node: NodeId,
+        camera_index: usize,
+        camera: oxideav_mesh3d::Camera,
+        world: [[f32; 4]; 4],
+    ) -> Self {
+        Self {
+            node,
+            camera_index,
+            camera,
+            world,
+        }
+    }
+
+    /// Set `node`.
+    #[must_use]
+    pub fn with_node(mut self, v: NodeId) -> Self {
+        self.node = v;
+        self
+    }
+
+    /// Set `camera_index`.
+    #[must_use]
+    pub fn with_camera_index(mut self, v: usize) -> Self {
+        self.camera_index = v;
+        self
+    }
+
+    /// Set `camera`.
+    #[must_use]
+    pub fn with_camera(mut self, v: oxideav_mesh3d::Camera) -> Self {
+        self.camera = v;
+        self
+    }
+
+    /// Set `world`.
+    #[must_use]
+    pub fn with_world(mut self, v: [[f32; 4]; 4]) -> Self {
+        self.world = v;
+        self
+    }
+}
+
 /// The flattened, world-space scene a backend renders.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PreparedScene {
     /// Draw items in scene-graph pre-order (node order, then primitive
     /// order).
@@ -535,6 +1045,50 @@ pub struct PreparedScene {
     /// fallback.
     pub scene_lights: bool,
     bounds: Option<([f32; 3], [f32; 3])>,
+}
+
+impl PreparedScene {
+    /// Set `items`.
+    #[must_use]
+    pub fn with_items(mut self, v: Vec<DrawItem>) -> Self {
+        self.items = v;
+        self
+    }
+
+    /// Set `materials`.
+    #[must_use]
+    pub fn with_materials(mut self, v: Vec<PreparedMaterial>) -> Self {
+        self.materials = v;
+        self
+    }
+
+    /// Set `textures`.
+    #[must_use]
+    pub fn with_textures(mut self, v: Vec<Option<PreparedTexture>>) -> Self {
+        self.textures = v;
+        self
+    }
+
+    /// Set `lights`.
+    #[must_use]
+    pub fn with_lights(mut self, v: Vec<PreparedLight>) -> Self {
+        self.lights = v;
+        self
+    }
+
+    /// Set `cameras`.
+    #[must_use]
+    pub fn with_cameras(mut self, v: Vec<SceneCameraInstance>) -> Self {
+        self.cameras = v;
+        self
+    }
+
+    /// Set `scene_lights`.
+    #[must_use]
+    pub fn with_scene_lights(mut self, v: bool) -> Self {
+        self.scene_lights = v;
+        self
+    }
 }
 
 impl PreparedScene {

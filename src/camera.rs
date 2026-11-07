@@ -58,7 +58,8 @@ pub enum DepthRange {
 /// Resolved view camera — projection matrices for rasterisers plus
 /// the retained placement for per-pixel ray generation. Shared by
 /// every backend so all of them frame the same view of a scene.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Camera {
     /// World → view matrix (rows are the camera basis; the camera
     /// looks down view-space `-Z`).
@@ -87,6 +88,85 @@ pub struct Camera {
     pub half_w: f32,
     /// Vertical counterpart of [`Camera::half_w`].
     pub half_h: f32,
+}
+
+impl Camera {
+    /// Set `view`.
+    #[must_use]
+    pub fn with_view(mut self, v: [[f32; 4]; 4]) -> Self {
+        self.view = v;
+        self
+    }
+
+    /// Set `proj`.
+    #[must_use]
+    pub fn with_proj(mut self, v: [[f32; 4]; 4]) -> Self {
+        self.proj = v;
+        self
+    }
+
+    /// Set `eye`.
+    #[must_use]
+    pub fn with_eye(mut self, v: [f32; 3]) -> Self {
+        self.eye = v;
+        self
+    }
+
+    /// Set `forward`.
+    #[must_use]
+    pub fn with_forward(mut self, v: [f32; 3]) -> Self {
+        self.forward = v;
+        self
+    }
+
+    /// Set `side`.
+    #[must_use]
+    pub fn with_side(mut self, v: [f32; 3]) -> Self {
+        self.side = v;
+        self
+    }
+
+    /// Set `up`.
+    #[must_use]
+    pub fn with_up(mut self, v: [f32; 3]) -> Self {
+        self.up = v;
+        self
+    }
+
+    /// Set `projection`.
+    #[must_use]
+    pub fn with_projection(mut self, v: Projection) -> Self {
+        self.projection = v;
+        self
+    }
+
+    /// Set `near`.
+    #[must_use]
+    pub fn with_near(mut self, v: f32) -> Self {
+        self.near = v;
+        self
+    }
+
+    /// Set `far`.
+    #[must_use]
+    pub fn with_far(mut self, v: f32) -> Self {
+        self.far = v;
+        self
+    }
+
+    /// Set `half_w`.
+    #[must_use]
+    pub fn with_half_w(mut self, v: f32) -> Self {
+        self.half_w = v;
+        self
+    }
+
+    /// Set `half_h`.
+    #[must_use]
+    pub fn with_half_h(mut self, v: f32) -> Self {
+        self.half_h = v;
+        self
+    }
 }
 
 impl Camera {

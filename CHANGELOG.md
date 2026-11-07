@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on the prepared / trace records whose fields all have one; full-field `new` on `DrawItem`, `PreparedLight`, `SceneCameraInstance`, `DecodedImage`, `PreparedTexture` and `CameraSpec`; `with_<field>` setters on every newly `#[non_exhaustive]` record and on `RenderOptions`, `PathTraceOptions`, `LightSpec` and `CameraSpec` so callers can migrate off struct literals.
+
+### Changed
+
+- API hygiene: enums `DrawTopology`, `ColorSpace`, `DecodedPixels` and `TexLod`, and records `BrdfParams`, `Camera`, `PrepareOptions`, `DrawItem`, `TextureBinding`, `PreparedMaterial`, `PreparedLight`, `LightSample`, `SceneCameraInstance`, `PreparedScene`, `DecodedImage`, `MipLevel`, `PreparedTexture`, `TraceHit`, `Surface` and `EmissiveLights` are now `#[non_exhaustive]`. `DepthRange` stays exhaustive (the two clip-space conventions); image buffers (`RgbaImage`, `HdrImage`) and `TriRef` stay plain value types. `RenderOptions`, `PathTraceOptions`, `LightSpec`, `CameraSpec` and `LightKind` stay exhaustive for now because sibling crates still build or match them.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-render/compare/v0.0.5...v0.0.6) - 2026-10-23
 
 ### Added

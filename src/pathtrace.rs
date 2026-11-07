@@ -1432,6 +1432,7 @@ pub fn dispersion_iors(ior: f32, dispersion: f32) -> [f32; 3] {
 /// `Φ_t = A_t · lum(Le_t) · (2 if double-sided)`). Public so GPU ports
 /// sample the identical distribution.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct EmissiveLights {
     /// Global triangle id per light.
     pub tris: Vec<u32>,
@@ -1441,6 +1442,36 @@ pub struct EmissiveLights {
     pub cdf: Vec<f32>,
     /// Global triangle → light index (`u32::MAX` = not a light).
     pub lookup: Vec<u32>,
+}
+
+impl EmissiveLights {
+    /// Set `tris`.
+    #[must_use]
+    pub fn with_tris(mut self, v: Vec<u32>) -> Self {
+        self.tris = v;
+        self
+    }
+
+    /// Set `pmf`.
+    #[must_use]
+    pub fn with_pmf(mut self, v: Vec<f32>) -> Self {
+        self.pmf = v;
+        self
+    }
+
+    /// Set `cdf`.
+    #[must_use]
+    pub fn with_cdf(mut self, v: Vec<f32>) -> Self {
+        self.cdf = v;
+        self
+    }
+
+    /// Set `lookup`.
+    #[must_use]
+    pub fn with_lookup(mut self, v: Vec<u32>) -> Self {
+        self.lookup = v;
+        self
+    }
 }
 
 impl EmissiveLights {

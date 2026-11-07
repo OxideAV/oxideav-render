@@ -85,6 +85,7 @@ pub fn decode_raw_rgba8(bytes: &[u8]) -> Option<DecodedImage> {
 
 /// Decoded texels handed back by a [`TextureResolver`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DecodedPixels {
     /// Row-major RGBA8, `width * height * 4` bytes. Colour channels
     /// are interpreted per the binding (sRGB for colour textures,
@@ -97,6 +98,7 @@ pub enum DecodedPixels {
 
 /// A decoded 2-D image.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedImage {
     /// Width in texels (`>= 1`).
     pub width: u32,
@@ -104,6 +106,38 @@ pub struct DecodedImage {
     pub height: u32,
     /// Texel payload.
     pub pixels: DecodedPixels,
+}
+
+impl DecodedImage {
+    /// Build a `DecodedImage` from every field.
+    pub fn new(width: u32, height: u32, pixels: DecodedPixels) -> Self {
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `pixels`.
+    #[must_use]
+    pub fn with_pixels(mut self, v: DecodedPixels) -> Self {
+        self.pixels = v;
+        self
+    }
 }
 
 impl DecodedImage {
@@ -187,6 +221,7 @@ pub fn mime_from_uri(uri: &str) -> Option<&'static str> {
 
 /// How a texture's colour channels are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ColorSpace {
     /// sRGB-encoded colour (base colour, emissive): decoded to linear
     /// before filtering.
@@ -196,7 +231,8 @@ pub enum ColorSpace {
 }
 
 /// One mip level: linear-light RGBA `f32` texels.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct MipLevel {
     /// Level width.
     pub width: u32,
@@ -204,6 +240,29 @@ pub struct MipLevel {
     pub height: u32,
     /// Row-major texels.
     pub texels: Vec<[f32; 4]>,
+}
+
+impl MipLevel {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `texels`.
+    #[must_use]
+    pub fn with_texels(mut self, v: Vec<[f32; 4]>) -> Self {
+        self.texels = v;
+        self
+    }
 }
 
 impl MipLevel {
@@ -326,11 +385,33 @@ fn build_mips(img: &DecodedImage, space: ColorSpace) -> Vec<MipLevel> {
 /// A texture ready to sample: shared texel data plus the glTF sampler
 /// state of the [`Texture`] that referenced it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreparedTexture {
     /// Decoded texels + mip chains.
     pub data: Arc<TextureData>,
     /// glTF sampler (filters + wrap modes).
     pub sampler: Sampler,
+}
+
+impl PreparedTexture {
+    /// Build a `PreparedTexture` from every field.
+    pub fn new(data: Arc<TextureData>, sampler: Sampler) -> Self {
+        Self { data, sampler }
+    }
+
+    /// Set `data`.
+    #[must_use]
+    pub fn with_data(mut self, v: Arc<TextureData>) -> Self {
+        self.data = v;
+        self
+    }
+
+    /// Set `sampler`.
+    #[must_use]
+    pub fn with_sampler(mut self, v: Sampler) -> Self {
+        self.sampler = v;
+        self
+    }
 }
 
 impl PreparedTexture {

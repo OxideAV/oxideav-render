@@ -54,7 +54,8 @@ pub fn f_schlick(f0: [f32; 3], v_dot_h: f32) -> [f32; 3] {
 }
 
 /// Inputs of [`eval`] derived from the material.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct BrdfParams {
     /// Diffuse colour `c_diff`.
     pub c_diff: [f32; 3],
@@ -62,6 +63,29 @@ pub struct BrdfParams {
     pub f0: [f32; 3],
     /// GGX `α` (`roughness²`, clamped to [`MIN_ALPHA`]).
     pub alpha: f32,
+}
+
+impl BrdfParams {
+    /// Set `c_diff`.
+    #[must_use]
+    pub fn with_c_diff(mut self, v: [f32; 3]) -> Self {
+        self.c_diff = v;
+        self
+    }
+
+    /// Set `f0`.
+    #[must_use]
+    pub fn with_f0(mut self, v: [f32; 3]) -> Self {
+        self.f0 = v;
+        self
+    }
+
+    /// Set `alpha`.
+    #[must_use]
+    pub fn with_alpha(mut self, v: f32) -> Self {
+        self.alpha = v;
+        self
+    }
 }
 
 impl BrdfParams {
